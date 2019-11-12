@@ -23,7 +23,7 @@ pub const CHUNCK_BUFFER_SIZE: usize = 32*1024;
 ///
 /// This is used only in fuzzing. `afl` automatically adds `--cfg fuzzing` to RUSTFLAGS which can
 /// be used to detect that build.
-const CHECKSUM_DISABLED: bool = cfg!(fuzzing);
+const CHECKSUM_DISABLED: bool = true;
 
 fn zlib_stream() -> InflateStream {
     if CHECKSUM_DISABLED {
@@ -354,7 +354,9 @@ impl StreamingDecoder {
                         let buf = &buf[..n as usize];
                         crc.update(buf);
                         raw_bytes.extend_from_slice(buf);
-                        *remaining -= n;
+                        if !self.have_idat {
+                            *remaining -= n;
+                        }
                         if *remaining == 0 {
                             goto!(n as usize, PartialChunk(type_str
                             ))
