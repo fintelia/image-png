@@ -69,8 +69,7 @@ impl Default for Limits {
 
 /// PNG Decoder
 pub struct Decoder<R: Read> {
-    /// Reader
-    r: R,
+    read_decoder: ReadDecoder<R>,
     /// Output transformations
     transform: Transformations,
     /// Limits on resources the Decoder is allowed to use
@@ -135,7 +134,11 @@ impl<R: Read> Decoder<R> {
     /// Create a new decoder configuration with custom limits.
     pub fn new_with_limits(r: R, limits: Limits) -> Decoder<R> {
         Decoder {
-            r,
+            read_decoder: ReadDecoder {
+                reader: BufReader::with_capacity(CHUNCK_BUFFER_SIZE, r),
+                decoder: StreamingDecoder::new(),
+                at_eof: false,
+            },
             transform: Transformations::IDENTITY,
             limits,
             decode_config: DecodeConfig::default(),
@@ -169,18 +172,30 @@ impl<R: Read> Decoder<R> {
         self.limits = limits;
     }
 
-    /// Reads all meta data until the first IDAT chunk
-    pub fn read_info(self) -> Result<Reader<R>, DecodingError> {
-        let mut streaming_decoder = StreamingDecoder::new();
-        streaming_decoder.set_decode_config(self.decode_config);
-
-        let mut reader = Reader::new(self.r, streaming_decoder, self.transform, self.limits);
-        reader.init()?;
-
-        // Check if the output buffer can be represented at all.
-        if reader.checked_output_buffer_size().is_none() {
-            return Err(DecodingError::LimitsExceeded);
+    /// Read the PNG header and return the information contained within.
+    ///
+    /// Most image metadata will not be read until `read_info` is called, so those fields will be
+    /// None or empty.
+    pub fn read_header_info(&mut self) -> Result<&Info, DecodingError> {
+        while self.read_decoder.info().is_none() {
+            if self.read_decoder.decode_next(&mut Vec::new())?.is_none() {
+                return Err(DecodingError::Format(
+                    FormatErrorInner::MissingImageData.into(),
+                ));
+            }
         }
+        Ok(self.read_decoder.info().unwrap())
+    }
+
+    /// Reads all meta data until the first IDAT chunk
+    pub fn read_info(mut self) -> Result<Reader<R>, DecodingError> {
+        self.read_header_info()?;
+        self.read_decoder
+            .decoder
+            .set_decode_config(self.decode_config);
+
+        let mut reader = Reader::new(self.read_decoder, self.transform, self.limits);
+        reader.read_until_image_data(true)?;
 
         Ok(reader)
     }
@@ -318,8 +333,6 @@ enum InterlaceIter {
 /// Denote a frame as given by sequence numbers.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SubframeIdx {
-    /// The info has not yet been decoded.
-    Uninit,
     /// The initial frame in an IDAT chunk without fcTL chunk applying to it.
     /// Note that this variant precedes `Some` as IDAT frames precede fdAT frames and all fdAT
     /// frames must have a fcTL applying to it.
@@ -338,13 +351,9 @@ macro_rules! get_info(
 
 impl<R: Read> Reader<R> {
     /// Creates a new PNG reader
-    fn new(r: R, d: StreamingDecoder, t: Transformations, limits: Limits) -> Reader<R> {
+    fn new(read_decoder: ReadDecoder<R>, t: Transformations, limits: Limits) -> Reader<R> {
         Reader {
-            decoder: ReadDecoder {
-                reader: BufReader::with_capacity(CHUNCK_BUFFER_SIZE, r),
-                decoder: d,
-                at_eof: false,
-            },
+            decoder: read_decoder,
             bpp: BytesPerPixel::One,
             subframe: SubframeInfo::not_yet_init(),
             fctl_read: 0,
@@ -360,13 +369,30 @@ impl<R: Read> Reader<R> {
 
     /// Reads all meta data until the next frame data starts.
     /// Requires IHDR before the IDAT and fcTL before fdAT.
-    fn init(&mut self) -> Result<OutputInfo, DecodingError> {
-        if self.next_frame == self.subframe_idx() {
-            return Ok(self.output_info());
-        } else if self.next_frame == SubframeIdx::End {
-            return Err(DecodingError::Parameter(
-                ParameterErrorKind::PolledAfterEndOfImage.into(),
-            ));
+    fn read_until_image_data(&mut self, initial_frame: bool) -> Result<OutputInfo, DecodingError> {
+        if initial_frame {
+            // Check if the decoding buffer of a single raw line has a valid size.
+            if self.info().checked_raw_row_length().is_none() {
+                return Err(DecodingError::LimitsExceeded);
+            }
+
+            // Check if the output buffer has a valid size.
+            if self.checked_output_buffer_size().is_none() {
+                return Err(DecodingError::LimitsExceeded);
+            }
+        } else {
+            let subframe_idx = match self.decoder.info().unwrap().frame_control() {
+                None => SubframeIdx::Initial,
+                Some(_) => SubframeIdx::Some(self.fctl_read - 1),
+            };
+
+            if self.next_frame == subframe_idx {
+                return Ok(self.output_info());
+            } else if self.next_frame == SubframeIdx::End {
+                return Err(DecodingError::Parameter(
+                    ParameterErrorKind::PolledAfterEndOfImage.into(),
+                ));
+            }
         }
 
         loop {
@@ -387,9 +413,6 @@ impl<R: Read> Reader<R> {
                         FormatErrorInner::MissingImageData.into(),
                     ))
                 }
-                Some(Decoded::Header { .. }) => {
-                    self.validate_buffer_sizes()?;
-                }
                 // Ignore all other chunk events. Any other chunk may be between IDAT chunks, fdAT
                 // chunks and their control chunks.
                 _ => {}
@@ -406,7 +429,16 @@ impl<R: Read> Reader<R> {
             // TODO: reuse the results obtained during the above check.
             self.subframe = SubframeInfo::new(info);
         }
-        self.allocate_out_buf()?;
+
+        let width = self.subframe.width;
+        let bytes = self.limits.bytes;
+        let buflen = match self.line_size(width) {
+            Some(buflen) if buflen <= bytes => buflen,
+            // Should we differentiate between platform limits and others?
+            _ => return Err(DecodingError::LimitsExceeded),
+        };
+        self.processed.resize(buflen, 0u8);
+
         self.prev = vec![0; self.subframe.rowlen];
         Ok(self.output_info())
     }
@@ -426,29 +458,11 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    fn reset_current(&mut self) {
-        self.current.clear();
-        self.scan_start = 0;
-    }
-
     /// Get information on the image.
     ///
     /// The structure will change as new frames of an animated image are decoded.
     pub fn info(&self) -> &Info {
         self.decoder.info().unwrap()
-    }
-
-    /// Get the subframe index of the current info.
-    fn subframe_idx(&self) -> SubframeIdx {
-        let info = match self.decoder.info() {
-            None => return SubframeIdx::Uninit,
-            Some(info) => info,
-        };
-
-        match info.frame_control() {
-            None => SubframeIdx::Initial,
-            Some(_) => SubframeIdx::Some(self.fctl_read - 1),
-        }
     }
 
     /// Call after decoding an image, to advance expected state to the next.
@@ -492,7 +506,7 @@ impl<R: Read> Reader<R> {
     /// frame (or subframe), all samples are in big endian byte order where this matters.
     pub fn next_frame(&mut self, buf: &mut [u8]) -> Result<OutputInfo, DecodingError> {
         // Advance until we've read the info / fcTL for this frame.
-        let info = self.init()?;
+        let info = self.read_until_image_data(false)?;
         // TODO 16 bit
         let (color_type, bit_depth) = self.output_color_type();
         if buf.len() < self.output_buffer_size() {
@@ -505,7 +519,9 @@ impl<R: Read> Reader<R> {
             ));
         }
 
-        self.reset_current();
+        self.current.clear();
+        self.scan_start = 0;
+
         let width = self.info().width;
         if self.info().interlaced {
             while let Some(InterlacedRow {
@@ -545,15 +561,6 @@ impl<R: Read> Reader<R> {
 
     /// Returns the next processed row of the image
     pub fn next_interlaced_row(&mut self) -> Result<Option<InterlacedRow>, DecodingError> {
-        match self.next_interlaced_row_impl() {
-            Err(err) => Err(err),
-            Ok(None) => Ok(None),
-            Ok(s) => Ok(s),
-        }
-    }
-
-    /// Fetch the next interlaced row and filter it according to our own transformations.
-    fn next_interlaced_row_impl(&mut self) -> Result<Option<InterlacedRow>, DecodingError> {
         use crate::common::ColorType::*;
         let transform = self.transform;
 
@@ -660,20 +667,6 @@ impl<R: Read> Reader<R> {
         size * height as usize
     }
 
-    fn validate_buffer_sizes(&self) -> Result<(), DecodingError> {
-        // Check if the decoding buffer of a single raw line has a valid size.
-        if self.info().checked_raw_row_length().is_none() {
-            return Err(DecodingError::LimitsExceeded);
-        }
-
-        // Check if the output buffer has a valid size.
-        if self.checked_output_buffer_size().is_none() {
-            return Err(DecodingError::LimitsExceeded);
-        }
-
-        Ok(())
-    }
-
     fn checked_output_buffer_size(&self) -> Option<usize> {
         let (width, height) = self.info().size();
         let (color, depth) = self.output_color_type();
@@ -714,18 +707,6 @@ impl<R: Read> Reader<R> {
 
         // Without the filter method byte
         color.checked_raw_row_length(depth, width).map(|n| n - 1)
-    }
-
-    fn allocate_out_buf(&mut self) -> Result<(), DecodingError> {
-        let width = self.subframe.width;
-        let bytes = self.limits.bytes;
-        let buflen = match self.line_size(width) {
-            Some(buflen) if buflen <= bytes => buflen,
-            // Should we differentiate between platform limits and others?
-            _ => return Err(DecodingError::LimitsExceeded),
-        };
-        self.processed.resize(buflen, 0u8);
-        Ok(())
     }
 
     fn next_pass(&mut self) -> Option<(usize, InterlaceInfo)> {
