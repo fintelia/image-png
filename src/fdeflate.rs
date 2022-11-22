@@ -157,11 +157,9 @@ impl<W: Write> Compressor<W> {
             let len_extra = LEN_EXTRA[run as usize - 3];
             let extra = ((run - 3) & BITMASKS[len_extra as usize]) as u64;
             self.write_bits(extra, len_extra + 1)?;
-            run = 0;
-        }
-
-        for _ in 0..run {
-            self.write_bits(HUFFMAN_CODES[0] as u64, HUFFMAN_LENGTHS[0])?;
+        } else {
+            debug_assert_eq!(HUFFMAN_CODES[0], 0);
+            self.write_bits(0, run as u8 * HUFFMAN_LENGTHS[0])?;
         }
 
         Ok(())
@@ -247,87 +245,26 @@ impl<W: Write> Compressor<W> {
                 continue;
             }
 
-            // if (ichunk & 0x00ffffff_ffffff00) == 0 {
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[0] as usize],
-            //     )?;
-            //     self.write_run(6)?;
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[7] as usize],
-            //     )?;
-            //     continue;
-            // }
-            // if (ichunk & 0x0000ffffff_ffff00) == 0 {
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[0] as usize],
-            //     )?;
-            //     self.write_run(5)?;
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[6] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[6] as usize],
-            //     )?;
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[7] as usize],
-            //     )?;
-            //     continue;
-            // }
-            // if (ichunk & 0x00ffffffff_ffff0000) == 0 {
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[0] as usize],
-            //     )?;
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[1] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[1] as usize],
-            //     )?;
-            //     self.write_run(5)?;
-            //     self.write_bits(
-            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
-            //         HUFFMAN_LENGTHS[chunk[7] as usize],
-            //     )?;
-            //     continue;
-            // }
+            let n0 = HUFFMAN_LENGTHS[chunk[0] as usize];
+            let n1 = HUFFMAN_LENGTHS[chunk[1] as usize];
+            let n2 = HUFFMAN_LENGTHS[chunk[2] as usize];
+            let n3 = HUFFMAN_LENGTHS[chunk[3] as usize];
+            let bits = HUFFMAN_CODES[chunk[0] as usize] as u64
+                | ((HUFFMAN_CODES[chunk[1] as usize] as u64) << n0)
+                | ((HUFFMAN_CODES[chunk[2] as usize] as u64) << (n0 + n1))
+                | ((HUFFMAN_CODES[chunk[3] as usize] as u64) << (n0 + n1 + n2));
+            self.write_bits(bits, n0 + n1 + n2 + n3)?;
 
-            for chunk in chunk.chunks_exact(4) {
-                let n0 = HUFFMAN_LENGTHS[chunk[0] as usize];
-                let n1 = HUFFMAN_LENGTHS[chunk[1] as usize];
-                let n2 = HUFFMAN_LENGTHS[chunk[2] as usize];
-                let n3 = HUFFMAN_LENGTHS[chunk[3] as usize];
-
-                let bits = HUFFMAN_CODES[chunk[0] as usize] as u64
-                    | ((HUFFMAN_CODES[chunk[1] as usize] as u64) << n0)
-                    | ((HUFFMAN_CODES[chunk[2] as usize] as u64) << (n0 + n1))
-                    | ((HUFFMAN_CODES[chunk[3] as usize] as u64) << (n0 + n1 + n2));
-
-                let nbits = n0 + n1 + n2 + n3;
-                self.write_bits(bits, nbits)?;
-            }
+            let n4 = HUFFMAN_LENGTHS[chunk[4] as usize];
+            let n5 = HUFFMAN_LENGTHS[chunk[5] as usize];
+            let n6 = HUFFMAN_LENGTHS[chunk[6] as usize];
+            let n7 = HUFFMAN_LENGTHS[chunk[7] as usize];
+            let bits2 = HUFFMAN_CODES[chunk[4] as usize] as u64
+                | ((HUFFMAN_CODES[chunk[5] as usize] as u64) << n4)
+                | ((HUFFMAN_CODES[chunk[6] as usize] as u64) << (n4 + n5))
+                | ((HUFFMAN_CODES[chunk[7] as usize] as u64) << (n4 + n5 + n6));
+            self.write_bits(bits2, n4 + n5 + n6 + n7)?;
         }
-
-        // let mut chunks = data.chunks_exact(4);
-        // for chunk in &mut chunks {
-        //     if chunk == [0; 4] {
-        //         run += 4;
-        //         continue;
-        //     } else if run > 0 {
-        //         self.write_run(run)?;
-        //         run = 0;
-        //     }
-        //     let n0 = HUFFMAN_LENGTHS[chunk[0] as usize];
-        //     let n1 = HUFFMAN_LENGTHS[chunk[1] as usize];
-        //     let n2 = HUFFMAN_LENGTHS[chunk[2] as usize];
-        //     let n3 = HUFFMAN_LENGTHS[chunk[3] as usize];
-        //     let bits = HUFFMAN_CODES[chunk[0] as usize] as u64
-        //         | ((HUFFMAN_CODES[chunk[1] as usize] as u64) << n0)
-        //         | ((HUFFMAN_CODES[chunk[2] as usize] as u64) << (n0 + n1))
-        //         | ((HUFFMAN_CODES[chunk[3] as usize] as u64) << (n0 + n1 + n2));
-        //     let nbits = n0 + n1 + n2 + n3;
-        //     self.write_bits(bits, nbits)?;
-        // }
 
         if run > 0 {
             self.write_run(run)?;
