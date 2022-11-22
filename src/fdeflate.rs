@@ -1,0 +1,402 @@
+//! Fast deflate implementation.
+//!
+//! This module contains an optimized implementation of the deflate algorithm.
+//! It is compatible with the zlib implementation, but make a bunch of
+//! simplifying assumptions that drastically improve encoding performance:
+//!
+//! - Exactly one block per deflate stream.
+//! - No distance codes except for run length encoding of zeros.
+//! - A single fixed huffman tree trained on a large corpus of PNG images.
+
+use simd_adler32::Adler32;
+use std::{
+    convert::TryInto,
+    io::{self, Write},
+};
+
+const HUFFMAN_LENGTHS: [u8; 288] = [
+    2, 3, 4, 5, 5, 6, 6, 7, 7, 7, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 10, 10, 10, 10, 10, 10, 10,
+    10, 10, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 11, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 11, 11, 11, 11, 11, 11, 11,
+    11, 11, 11, 10, 11, 10, 10, 10, 10, 10, 10, 10, 10, 10, 9, 9, 9, 9, 9, 8, 9, 8, 8, 8, 8, 8, 7,
+    7, 7, 6, 6, 6, 5, 4, 3, 12, 12, 12, 9, 9, 11, 10, 11, 11, 10, 11, 11, 11, 11, 11, 11, 12, 11,
+    12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 12, 9, 0, 0,
+];
+
+const HUFFMAN_CODES: [u16; 288] = compute_codes(&HUFFMAN_LENGTHS);
+
+/// Length code for length values (derived from deflate spec).
+#[rustfmt::skip]
+pub const LEN_SYM: [u16; 256] = [
+    257, 258, 259, 260, 261, 262, 263, 264, 265, 265, 266, 266, 267, 267, 268, 268,
+    269, 269, 269, 269, 270, 270, 270, 270, 271, 271, 271, 271, 272, 272, 272, 272,
+    273, 273, 273, 273, 273, 273, 273, 273, 274, 274, 274, 274, 274, 274, 274, 274,
+    275, 275, 275, 275, 275, 275, 275, 275, 276, 276, 276, 276, 276, 276, 276, 276,
+    277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277, 277,
+    278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278, 278,
+    279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279, 279,
+    280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280, 280,
+    281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281,
+    281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281, 281,
+    282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282,
+    282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282, 282,
+    283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283,
+    283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283, 283,
+    284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284,
+    284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 284, 285
+];
+
+/// Number of extra bits for length values (derived from deflate spec).
+#[rustfmt::skip]
+pub const LEN_EXTRA: [u8; 256] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,
+    2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+    5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 0
+];
+
+#[rustfmt::skip]
+const BITMASKS: [u32; 17] = [
+    0x0000, 0x0001, 0x0003, 0x0007, 0x000F, 0x001F, 0x003F, 0x007F, 0x00FF,
+    0x01FF, 0x03FF, 0x07FF, 0x0FFF, 0x1FFF, 0x3FFF, 0x7FFF, 0xFFFF
+];
+
+const fn compute_codes<const NSYMS: usize>(lengths: &[u8; NSYMS]) -> [u16; NSYMS] {
+    let mut codes = [0u16; NSYMS];
+
+    let mut code = 0u32;
+
+    let mut len = 1;
+    while len <= 16 {
+        let mut i = 0;
+        while i < lengths.len() {
+            if lengths[i] == len {
+                codes[i] = (code as u16).reverse_bits() >> (16 - len);
+                code += 1;
+            }
+            i += 1;
+        }
+        code <<= 1;
+        len += 1;
+    }
+
+    if code != 2 << 16 {
+        panic!("Invalid Huffman code lengths");
+    }
+
+    codes
+}
+
+pub struct Compressor<W: Write> {
+    checksum: Adler32,
+    buffer: u64,
+    nbits: u8,
+    writer: W,
+}
+impl<W: Write> Compressor<W> {
+    fn write_bits(&mut self, bits: u64, nbits: u8) -> io::Result<()> {
+        debug_assert!(nbits <= 64);
+
+        self.buffer |= bits << self.nbits;
+        self.nbits += nbits;
+
+        if self.nbits >= 64 {
+            self.writer.write_all(&self.buffer.to_le_bytes())?;
+            self.nbits -= 64;
+            self.buffer = bits.checked_shr((nbits - self.nbits) as u32).unwrap_or(0);
+        }
+        debug_assert!(self.nbits < 64);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if self.nbits % 8 != 0 {
+            self.write_bits(0, 8 - self.nbits % 8)?;
+        }
+        if self.nbits > 0 {
+            self.writer
+                .write_all(&self.buffer.to_le_bytes()[..self.nbits as usize / 8])
+                .unwrap();
+            self.buffer = 0;
+            self.nbits = 0;
+        }
+        Ok(())
+    }
+
+    fn write_run(&mut self, mut run: u32) -> io::Result<()> {
+        self.write_bits(HUFFMAN_CODES[0] as u64, HUFFMAN_LENGTHS[0])?;
+        run -= 1;
+
+        while run >= 258 {
+            self.write_bits(HUFFMAN_CODES[285] as u64, HUFFMAN_LENGTHS[285] + 1)?;
+            run -= 258;
+        }
+
+        if run > 4 {
+            let sym = LEN_SYM[run as usize - 3] as usize;
+            self.write_bits(HUFFMAN_CODES[sym] as u64, HUFFMAN_LENGTHS[sym])?;
+
+            let len_extra = LEN_EXTRA[run as usize - 3];
+            let extra = ((run - 3) & BITMASKS[len_extra as usize]) as u64;
+            self.write_bits(extra, len_extra + 1)?;
+            run = 0;
+        }
+
+        for _ in 0..run {
+            self.write_bits(HUFFMAN_CODES[0] as u64, HUFFMAN_LENGTHS[0])?;
+        }
+
+        Ok(())
+    }
+
+    pub fn new(writer: W) -> Self {
+        Self {
+            checksum: Adler32::new(),
+            buffer: 0,
+            nbits: 0,
+            writer,
+        }
+    }
+
+    pub fn write_headers(&mut self) -> io::Result<()> {
+        self.write_bits(0x0178, 16)?; // zlib header
+
+        self.write_bits(0b1, 1)?; // BFINAL
+        self.write_bits(0b10, 2)?; // Dynamic Huffman block
+
+        self.write_bits((HUFFMAN_LENGTHS.len() - 257) as u64, 5)?; // # of length / literal codes
+        self.write_bits(0, 5)?; // 1 distance code
+        self.write_bits(15, 4)?; // 16 code length codes
+
+        // Write code lengths for code length alphabet
+        for _ in 0..3 {
+            self.write_bits(0, 3)?;
+        }
+        for _ in 0..16 {
+            self.write_bits(4, 3)?;
+        }
+
+        // Write code lengths for length/literal alphabet
+        for &len in &HUFFMAN_LENGTHS {
+            self.write_bits((len.reverse_bits() >> 4) as u64, 4)?;
+        }
+
+        // Write code lengths for distance alphabet
+        for _ in 0..1 {
+            self.write_bits(0b1000, 4)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_data(&mut self, data: &[u8]) -> io::Result<()> {
+        self.checksum.write(data);
+
+        let mut run = 0;
+        let mut chunks = data.chunks_exact(8);
+        for chunk in &mut chunks {
+            let ichunk = u64::from_le_bytes(chunk.try_into().unwrap());
+
+            if ichunk == 0 {
+                run += 8;
+                continue;
+            } else if run > 0 {
+                let run_extra = ichunk.trailing_zeros() / 8;
+                self.write_run(run + run_extra)?;
+                run = 0;
+
+                if run_extra > 0 {
+                    run = ichunk.leading_zeros() / 8;
+                    for &b in &chunk[run_extra as usize..8 - run as usize] {
+                        self.write_bits(
+                            HUFFMAN_CODES[b as usize] as u64,
+                            HUFFMAN_LENGTHS[b as usize],
+                        )?;
+                    }
+                    continue;
+                }
+            }
+
+            let run_start = ichunk.leading_zeros() / 8;
+            if run_start > 0 {
+                for &b in &chunk[..8 - run_start as usize] {
+                    self.write_bits(
+                        HUFFMAN_CODES[b as usize] as u64,
+                        HUFFMAN_LENGTHS[b as usize],
+                    )?;
+                }
+                run = run_start;
+                continue;
+            }
+
+            // if (ichunk & 0x00ffffff_ffffff00) == 0 {
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[0] as usize],
+            //     )?;
+            //     self.write_run(6)?;
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[7] as usize],
+            //     )?;
+            //     continue;
+            // }
+            // if (ichunk & 0x0000ffffff_ffff00) == 0 {
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[0] as usize],
+            //     )?;
+            //     self.write_run(5)?;
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[6] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[6] as usize],
+            //     )?;
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[7] as usize],
+            //     )?;
+            //     continue;
+            // }
+            // if (ichunk & 0x00ffffffff_ffff0000) == 0 {
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[0] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[0] as usize],
+            //     )?;
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[1] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[1] as usize],
+            //     )?;
+            //     self.write_run(5)?;
+            //     self.write_bits(
+            //         HUFFMAN_CODES[chunk[7] as usize] as u64,
+            //         HUFFMAN_LENGTHS[chunk[7] as usize],
+            //     )?;
+            //     continue;
+            // }
+
+            for chunk in chunk.chunks_exact(4) {
+                let n0 = HUFFMAN_LENGTHS[chunk[0] as usize];
+                let n1 = HUFFMAN_LENGTHS[chunk[1] as usize];
+                let n2 = HUFFMAN_LENGTHS[chunk[2] as usize];
+                let n3 = HUFFMAN_LENGTHS[chunk[3] as usize];
+
+                let bits = HUFFMAN_CODES[chunk[0] as usize] as u64
+                    | ((HUFFMAN_CODES[chunk[1] as usize] as u64) << n0)
+                    | ((HUFFMAN_CODES[chunk[2] as usize] as u64) << (n0 + n1))
+                    | ((HUFFMAN_CODES[chunk[3] as usize] as u64) << (n0 + n1 + n2));
+
+                let nbits = n0 + n1 + n2 + n3;
+                self.write_bits(bits, nbits)?;
+            }
+        }
+
+        // let mut chunks = data.chunks_exact(4);
+        // for chunk in &mut chunks {
+        //     if chunk == [0; 4] {
+        //         run += 4;
+        //         continue;
+        //     } else if run > 0 {
+        //         self.write_run(run)?;
+        //         run = 0;
+        //     }
+        //     let n0 = HUFFMAN_LENGTHS[chunk[0] as usize];
+        //     let n1 = HUFFMAN_LENGTHS[chunk[1] as usize];
+        //     let n2 = HUFFMAN_LENGTHS[chunk[2] as usize];
+        //     let n3 = HUFFMAN_LENGTHS[chunk[3] as usize];
+        //     let bits = HUFFMAN_CODES[chunk[0] as usize] as u64
+        //         | ((HUFFMAN_CODES[chunk[1] as usize] as u64) << n0)
+        //         | ((HUFFMAN_CODES[chunk[2] as usize] as u64) << (n0 + n1))
+        //         | ((HUFFMAN_CODES[chunk[3] as usize] as u64) << (n0 + n1 + n2));
+        //     let nbits = n0 + n1 + n2 + n3;
+        //     self.write_bits(bits, nbits)?;
+        // }
+
+        if run > 0 {
+            self.write_run(run)?;
+        }
+
+        for &b in chunks.remainder() {
+            self.write_bits(
+                HUFFMAN_CODES[b as usize] as u64,
+                HUFFMAN_LENGTHS[b as usize],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> io::Result<W> {
+        // Write end of block
+        self.write_bits(HUFFMAN_CODES[256] as u64, HUFFMAN_LENGTHS[256])?;
+        self.flush()?;
+
+        // Write Adler32 checksum
+        let checksum: u32 = self.checksum.finish();
+        self.writer
+            .write_all(checksum.to_be_bytes().as_ref())
+            .unwrap();
+        Ok(self.writer)
+    }
+}
+
+pub fn compress_to_vec(input: &[u8]) -> Vec<u8> {
+    let mut compressor = Compressor::new(Vec::with_capacity(input.len() / 4));
+    compressor.write_headers().unwrap();
+    compressor.write_data(input).unwrap();
+    compressor.finish().unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rand::Rng;
+
+    fn roundtrip(data: &[u8]) {
+        let compressed = compress_to_vec(data);
+        let decompressed = miniz_oxide::inflate::decompress_to_vec_zlib(&compressed).unwrap();
+        assert_eq!(&decompressed, data);
+    }
+
+    #[test]
+    fn it_works() {
+        roundtrip(b"Hello world!");
+    }
+
+    #[test]
+    fn constant() {
+        roundtrip(&vec![0; 2048]);
+        roundtrip(&vec![5; 2048]);
+        roundtrip(&vec![128; 2048]);
+        roundtrip(&vec![254; 2048]);
+    }
+
+    #[test]
+    fn random() {
+        let mut rng = rand::thread_rng();
+        let mut data = vec![0; 2345];
+        for _ in 0..10 {
+            for byte in &mut data {
+                *byte = rng.gen();
+            }
+            roundtrip(&data);
+        }
+    }
+}

@@ -73,6 +73,9 @@ pub mod text_metadata;
 mod traits;
 mod utils;
 
+#[doc(hidden)]
+pub mod fdeflate;
+
 pub use crate::{
     common::*,
     decoder::{Decoded, Decoder, DecodingError, Limits, OutputInfo, Reader, StreamingDecoder},
