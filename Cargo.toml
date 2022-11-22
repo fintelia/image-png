@@ -3,6 +3,9 @@ name = "png"
 version = "0.17.7"
 license = "MIT OR Apache-2.0"
 
+# note: when changed, also update test runner in `.github/workflows/rust.yml`
+rust-version = "1.61.0"
+
 description = "PNG decoding and encoding library in pure Rust"
 categories = ["multimedia::images"]
 authors = ["The image-rs Developers"]
@@ -24,7 +27,7 @@ bitflags = "1.0"
 crc32fast = "1.2.0"
 flate2 = "1.0"
 miniz_oxide = "0.6.0"
-simd-adler32 = { version = "0.3.4", default-features = false, features = ["std"] }
+simd-adler32 = "0.3.4"
 
 [dev-dependencies]
 criterion = "0.3.1"
