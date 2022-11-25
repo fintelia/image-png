@@ -76,6 +76,9 @@ mod utils;
 #[doc(hidden)]
 pub mod fdeflate;
 
+#[doc(hidden)]
+pub mod finflate;
+
 pub use crate::{
     common::*,
     decoder::{Decoded, Decoder, DecodingError, Limits, OutputInfo, Reader, StreamingDecoder},

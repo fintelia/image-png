@@ -680,6 +680,7 @@ impl StreamingDecoder {
                 let chunk_len = self.current_chunk.raw_bytes.len();
                 let chunk_data = &self.current_chunk.raw_bytes[n..];
                 let c = self.inflater.decompress(chunk_data, image_data)?;
+                assert!(c <= chunk_data.len());
                 n += c;
                 if n == chunk_len && c == 0 {
                     self.current_chunk.raw_bytes.clear();

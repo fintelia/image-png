@@ -79,7 +79,7 @@ const BITMASKS: [u32; 17] = [
     0x01FF, 0x03FF, 0x07FF, 0x0FFF, 0x1FFF, 0x3FFF, 0x7FFF, 0xFFFF
 ];
 
-const fn compute_codes<const NSYMS: usize>(lengths: &[u8; NSYMS]) -> [u16; NSYMS] {
+pub(crate) const fn compute_codes<const NSYMS: usize>(lengths: &[u8; NSYMS]) -> [u16; NSYMS] {
     let mut codes = [0u16; NSYMS];
 
     let mut code = 0u32;
