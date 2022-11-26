@@ -1,5 +1,7 @@
 use std::convert::TryInto;
 
+use simd_adler32::Adler32;
+
 const CLCL_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
@@ -9,7 +11,7 @@ const LEN_BITS: [u8; 29] = [
 ];
 
 const LEN_BASE: [usize; 29] = [
-    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 114, 131,
+    3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
     163, 195, 227, 258,
 ];
 
@@ -27,6 +29,7 @@ pub enum DecompressionError {
 pub struct Decompressor {
     buffer: u64,
     nbits: u8,
+    bits_read: u64,
     data_table: [[u8; 2]; 4096],
     advance_table: [u16; 4096],
 
@@ -37,6 +40,8 @@ pub struct Decompressor {
 
     done: bool,
     last: Option<u8>,
+
+    checksum: Adler32,
 }
 
 impl Decompressor {
@@ -44,6 +49,7 @@ impl Decompressor {
         Self {
             buffer: 0,
             nbits: 0,
+            bits_read: 0,
             data_table: [[0; 2]; 4096],
             advance_table: [u16::MAX; 4096],
             read_header: false,
@@ -51,6 +57,7 @@ impl Decompressor {
             queued_output: None,
             done: false,
             last: None,
+            checksum: Adler32::new(),
         }
     }
 
@@ -81,6 +88,7 @@ impl Decompressor {
         debug_assert!(self.nbits >= nbits);
         self.buffer >>= nbits;
         self.nbits -= nbits;
+        self.bits_read += nbits as u64;
     }
 
     fn read_bits(&mut self, nbits: u8, input: &mut &[u8]) -> Option<u64> {
@@ -97,7 +105,6 @@ impl Decompressor {
             || (input[0] & 0xf0) > 0x70
             || u16::from_be_bytes(input[..2].try_into().unwrap()) % 31 != 0
         {
-            panic!();
             return Err(DecompressionError::CorruptData);
         }
 
@@ -117,7 +124,6 @@ impl Decompressor {
         let hdist = self.read_bits(5, &mut block).unwrap() as usize + 1;
         let hclen = self.read_bits(4, &mut block).unwrap() as usize + 4;
         if hlit > 286 {
-            panic!();
             return Err(DecompressionError::CorruptData);
         }
         if hdist != 1 {
@@ -237,9 +243,10 @@ impl Decompressor {
             debug_assert_eq!(output_index, 0);
             output_index += n;
             self.queued_output = if n < len { Some((data, len - n)) } else { None };
-            if output_index == output.len() {
-                return Ok((0, output_index));
-            }
+            // if output_index == output.len() {
+            //     panic!();
+            //     return Ok((0, output_index));
+            // }
         }
 
         // if !self.queued_input.is_empty() {
@@ -289,6 +296,10 @@ impl Decompressor {
 
                 // Check for end of input symbol.
                 if symbol == 256 {
+                    // println!(
+                    //     "Found end of input symbol ({} bytes left)",
+                    //     remaining_input.len()
+                    // );
                     self.consume_bits(advance_input_bits);
                     self.done = true;
                     break;
@@ -323,7 +334,7 @@ impl Decompressor {
                 // fdeflate only writes runs of zeros, but handling non-zero runs isn't hard and
                 // it is too late to bail now.
                 if last != 0 {
-                    let end = (output.len() + length).saturating_sub(output_index);
+                    let end = (output_index + length).min(output.len());
                     output[output_index..end].fill(last);
                 }
 
@@ -339,11 +350,40 @@ impl Decompressor {
             }
         }
 
+        // self.data.extend_from_slice(&output[..output_index]);
+        self.checksum.write(&output[..output_index]);
+        // if self.done {
+        //     if self.bits_read % 8 != 0 {
+        //         self.consume_bits(8 - (self.bits_read % 8) as u8);
+        //     }
+        //     println!("current_nbits = {}", self.nbits);
+        //     println!("remaining_input = {:x?}", remaining_input);
+        //     if let Some(bits) = self.peak_bits(32, &mut remaining_input) {
+        //         let full_checksum = simd_adler32::read::adler32(&mut std::io::Cursor::new(&*self.data)).unwrap();
+
+        //         let checksum = self.checksum.finish();
+        //         assert_eq!(checksum, full_checksum);
+        //         assert_eq!(checksum.to_be(), bits as u32);
+        //         if bits as u32 != checksum {
+        //             panic!();
+        //             return Err(DecompressionError::CorruptData);
+        //         }
+        //     }
+        // }
+
         if self.done || !end_of_input || output_index >= output.len() - 1 {
             if output_index > 0 {
                 self.last = Some(output[output_index - 1])
             }
             let input_left = remaining_input.len();
+
+            // if self.done {
+            //     self.input_data.extend_from_slice(input);
+            //     // std::fs::write("data.bin", &self.input_data);
+            // } else {
+            //     self.input_data
+            //         .extend_from_slice(&input[..input.len() - input_left]);
+            // }
             Ok((input.len() - input_left, output_index))
         } else {
             panic!();
@@ -358,7 +398,7 @@ impl Decompressor {
 
 pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>, DecompressionError> {
     let mut decoder = Decompressor::new();
-    let mut output = vec![0; 32 * 1024];
+    let mut output = vec![0; 32 * 1024 * 1024];
     let mut input_index = 0;
     let mut output_index = 0;
     while !decoder.done() {
@@ -374,6 +414,10 @@ pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>, DecompressionError> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
+    use crate::fdeflate::{LEN_EXTRA, LEN_SYM};
+
     use super::*;
     use rand::Rng;
 
@@ -381,6 +425,34 @@ mod tests {
         let compressed = crate::fdeflate::compress_to_vec(data);
         let decompressed = decompress_to_vec(&compressed).unwrap();
         assert_eq!(&decompressed, data);
+    }
+    fn compare(data: &[u8]) {
+        let mut reference = Vec::new();
+        flate2::bufread::ZlibDecoder::new(data)
+            .read_to_end(&mut reference)
+            .unwrap();
+        let decompressed = decompress_to_vec(&data).unwrap();
+        assert_eq!(decompressed.len(), reference.len());
+        assert_eq!(decompressed, reference);
+    }
+
+    #[test]
+    fn tables() {
+        for (i, &bits) in LEN_BITS.iter().enumerate() {
+            let len_base = LEN_BASE[i];
+            for j in 0..(1 << bits) {
+                if i == 27 && j == 31 {
+                    continue;
+                }
+                assert_eq!(LEN_EXTRA[len_base + j - 3], bits, "{} {}", i, j);
+                assert_eq!(LEN_SYM[len_base + j - 3], i as u16 + 257, "{} {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn load() {
+        compare(include_bytes!("../data.bin"));
     }
 
     #[test]
