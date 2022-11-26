@@ -53,6 +53,12 @@ impl Compressor {
         }
     }
 }
+impl Default for Compressor {
+    fn default() -> Self {
+        //Compressor::FDeflate(finflate::Decompressor::new())
+        Compressor::FullZlib(DecompressorOxide::new())
+    }
+}
 
 /// Ergonomics wrapper around `miniz_oxide::inflate::stream` for zlib compressed data.
 pub(super) struct ZlibStream {
@@ -86,7 +92,7 @@ pub(super) struct ZlibStream {
 impl ZlibStream {
     pub(crate) fn new() -> Self {
         ZlibStream {
-            state: Box::new(Compressor::FDeflate(finflate::Decompressor::new())),
+            state: Default::default(),
             started: false,
             in_buffer: Vec::with_capacity(CHUNCK_BUFFER_SIZE),
             in_pos: 0,
@@ -100,7 +106,7 @@ impl ZlibStream {
         self.in_buffer.clear();
         self.out_buffer.clear();
         self.out_pos = 0;
-        self.state = Box::new(Compressor::FDeflate(finflate::Decompressor::new()));
+        *self.state = Default::default();
     }
 
     /// Fill the decoded buffer as far as possible from `data`.

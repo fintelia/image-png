@@ -25,7 +25,8 @@ include = [
 [dependencies]
 bitflags = "1.0"
 crc32fast = "1.2.0"
-flate2 = "1.0"
+#flate2 = "1.0"
+flate2 = { version = "1.0.25", default-features = false, features = ["zlib-ng"] }
 miniz_oxide = "0.6.0"
 simd-adler32 = "0.3.4"
 

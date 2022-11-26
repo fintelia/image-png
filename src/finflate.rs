@@ -26,6 +26,13 @@ pub enum DecompressionError {
     CorruptData,
 }
 
+enum State {
+    Header,
+    Data,
+    Checksum,
+    Done,
+}
+
 pub struct Decompressor {
     buffer: u64,
     nbits: u8,
@@ -61,28 +68,24 @@ impl Decompressor {
         }
     }
 
-    fn fill_buffer(&mut self, input: &[u8]) -> usize {
-        let nbytes = input.len().min((64 - self.nbits as usize) / 8);
-
-        let mut input_data = [0; 8];
-        input_data[..nbytes].copy_from_slice(&input[..nbytes]);
-        self.buffer |= u64::from_le_bytes(input_data) << self.nbits;
-        self.nbits += nbytes as u8 * 8;
-        nbytes
+    fn fill_buffer(&mut self, input: &mut &[u8]) {
+        if input.len() >= 8 {
+            self.buffer |= u64::from_le_bytes(input[..8].try_into().unwrap()) << self.nbits;
+            *input = &mut &input[(63 - self.nbits as usize) / 8..];
+            self.nbits |= 56;
+        } else {
+            let nbytes = input.len().min((64 - self.nbits as usize) / 8);
+            let mut input_data = [0; 8];
+            input_data[..nbytes].copy_from_slice(&input[..nbytes]);
+            self.buffer |= u64::from_le_bytes(input_data) << self.nbits;
+            self.nbits += nbytes as u8 * 8;
+            *input = &mut &input[nbytes..];
+        }
     }
 
-    fn peak_bits(&mut self, nbits: u8, input: &mut &[u8]) -> Option<u64> {
-        debug_assert!(nbits <= 56);
-
-        if self.nbits < nbits {
-            let advance = self.fill_buffer(input);
-            *input = &input[advance..];
-            if self.nbits < nbits {
-                return None;
-            }
-        };
-
-        Some(self.buffer & ((1u64 << nbits) - 1))
+    fn peak_bits(&mut self, nbits: u8) -> u64 {
+        debug_assert!(nbits <= 56 && nbits <= self.nbits);
+        self.buffer & ((1u64 << nbits) - 1)
     }
     fn consume_bits(&mut self, nbits: u8) {
         debug_assert!(self.nbits >= nbits);
@@ -92,7 +95,14 @@ impl Decompressor {
     }
 
     fn read_bits(&mut self, nbits: u8, input: &mut &[u8]) -> Option<u64> {
-        let result = self.peak_bits(nbits, input)?;
+        if self.nbits < nbits {
+            self.fill_buffer(input);
+            if self.nbits < nbits {
+                return None;
+            }
+        }
+
+        let result = self.peak_bits(nbits);
         self.consume_bits(nbits);
         Some(result)
     }
@@ -136,6 +146,7 @@ impl Decompressor {
             code_length_lengths[CLCL_ORDER[i]] = self.read_bits(3, &mut block).unwrap() as u8;
         }
         if code_length_lengths[16..] != [0; 3] || code_length_lengths[..16] != [4; 16] {
+            panic!();
             return Err(DecompressionError::NotFDeflate);
         }
         let code_length_codes: [u16; 16] =
@@ -148,6 +159,7 @@ impl Decompressor {
             lengths[i] = code_length_codes[code as usize] as u8;
         }
         if lengths[0] == 0 || lengths.iter().any(|&l| l > 12) {
+            panic!();
             return Err(DecompressionError::NotFDeflate);
         }
 
@@ -227,7 +239,6 @@ impl Decompressor {
 
         if !self.read_header {
             if input.len() < MAX_HEADER_BYTES && !end_of_input {
-                // We need more bytes to parse the header.
                 return Ok((0, 0));
             }
             let consumed = self.parse_header(input)?;
@@ -243,51 +254,106 @@ impl Decompressor {
             debug_assert_eq!(output_index, 0);
             output_index += n;
             self.queued_output = if n < len { Some((data, len - n)) } else { None };
-            // if output_index == output.len() {
-            //     panic!();
-            //     return Ok((0, output_index));
-            // }
         }
 
-        // if !self.queued_input.is_empty() {
-        //     let mut queued_input = std::mem::replace(&mut self.queued_input, Vec::new());
-        //     let (consumed_in, consumed_out) =
-        //         self.read(&queued_input, &mut output[output_index..], false)?;
-        //     output_index += consumed_out;
-        //     if consumed_in < queued_input.len() {
-        //         queued_input.drain(..consumed_in);
-        //         self.queued_input = queued_input;
-        //         return Ok((0, output_index));
-        //     }
-        // }
+        loop {
+            self.fill_buffer(&mut remaining_input);
+            if self.nbits >= 48 {
+                let bits = self.peak_bits(48);
+                let advance0 = self.advance_table[(bits & 0xfff) as usize];
+                let advance0_input_bits = advance0 & 0xf;
+                let advance1 = self.advance_table[(bits >> advance0_input_bits) as usize & 0xfff];
+                let advance1_input_bits = advance1 & 0xf;
+                let advance2 = self.advance_table
+                    [(bits >> (advance0_input_bits + advance1_input_bits)) as usize & 0xfff];
+                let advance2_input_bits = advance2 & 0xf;
+                let advance3 = self.advance_table[(bits
+                    >> (advance0_input_bits + advance1_input_bits + advance2_input_bits))
+                    as usize
+                    & 0xfff];
+                let advance3_input_bits = advance3 & 0xf;
 
-        while let Some(symbol) = self.peak_bits(12, &mut remaining_input) {
-            let data = self.data_table[symbol as usize];
-            let advance = self.advance_table[symbol as usize];
+                if advance0_input_bits > 0
+                    && advance1_input_bits > 0
+                    && advance2_input_bits > 0
+                    && advance3_input_bits > 0
+                {
+                    let advance0_output_bytes = (advance0 >> 4) as usize;
+                    let advance1_output_bytes = (advance1 >> 4) as usize;
+                    let advance2_output_bytes = (advance2 >> 4) as usize;
+                    let advance3_output_bytes = (advance3 >> 4) as usize;
+
+                    if output_index
+                        + advance0_output_bytes
+                        + advance1_output_bytes
+                        + advance2_output_bytes
+                        + advance3_output_bytes
+                        < output.len()
+                    {
+                        let data0 = self.data_table[(bits & 0xfff) as usize];
+                        let data1 = self.data_table[(bits >> advance0_input_bits) as usize & 0xfff];
+                        let data2 = self.data_table[(bits
+                            >> (advance0_input_bits + advance1_input_bits))
+                            as usize
+                            & 0xfff];
+                        let data3 = self.data_table[(bits
+                            >> (advance0_input_bits + advance1_input_bits + advance2_input_bits))
+                            as usize
+                            & 0xfff];
+
+                        let advance = advance0_input_bits
+                            + advance1_input_bits
+                            + advance2_input_bits
+                            + advance3_input_bits;
+                        self.consume_bits(advance as u8);
+
+                        output[output_index] = data0[0];
+                        output[output_index + 1] = data0[1];
+                        output_index += advance0_output_bytes;
+                        output[output_index] = data1[0];
+                        output[output_index + 1] = data1[1];
+                        output_index += advance1_output_bytes;
+                        output[output_index] = data2[0];
+                        output[output_index + 1] = data2[1];
+                        output_index += advance2_output_bytes;
+                        output[output_index] = data3[0];
+                        output[output_index + 1] = data3[1];
+                        output_index += advance3_output_bytes;
+                        continue;
+                    }
+                }
+            }
+
+            if self.nbits < 18 {
+                break;
+            }
+
+            let table_index = self.peak_bits(12);
+            let data = self.data_table[table_index as usize];
+            let advance = self.advance_table[table_index as usize];
 
             let advance_input_bits = (advance & 0x0f) as u8;
             let advance_output_bytes = (advance >> 4) as usize;
 
             if advance_input_bits > 0 {
-                if output_index >= output.len() {
-                    break;
-                } else if output_index + 1 == output.len() {
-                    if advance_output_bytes == 1 {
-                        output[output_index] = data[0];
-                        output_index += advance_output_bytes;
-                        self.consume_bits(advance_input_bits);
+                if output_index + 1 < output.len() {
+                    output[output_index] = data[0];
+                    output[output_index + 1] = data[1];
+                    output_index += advance_output_bytes;
+                    self.consume_bits(advance_input_bits);
+
+                    if output_index > output.len() {
+                        self.queued_output = Some((0, output_index - output.len()));
+                        output_index = output.len();
+                        break;
                     }
+                } else if output_index + advance_output_bytes == output.len() {
+                    debug_assert_eq!(advance_output_bytes, 1);
+                    output[output_index] = data[0];
+                    output_index += 1;
+                    self.consume_bits(advance_input_bits);
                     break;
-                }
-
-                output[output_index] = data[0];
-                output[output_index + 1] = data[1];
-                output_index += advance_output_bytes;
-                self.consume_bits(advance_input_bits);
-
-                if output_index > output.len() {
-                    self.queued_output = Some((0, output_index - output.len()));
-                    output_index = output.len();
+                } else {
                     break;
                 }
             } else {
@@ -296,27 +362,18 @@ impl Decompressor {
 
                 // Check for end of input symbol.
                 if symbol == 256 {
-                    // println!(
-                    //     "Found end of input symbol ({} bytes left)",
-                    //     remaining_input.len()
-                    // );
                     self.consume_bits(advance_input_bits);
                     self.done = true;
                     break;
                 }
 
                 let length_bits = LEN_BITS[symbol - 257];
-                let bits = match self
-                    .peak_bits(length_bits + advance_input_bits + 1, &mut remaining_input)
-                {
-                    Some(bits) => bits >> advance_input_bits,
-                    None => break,
-                };
+                let bits =
+                    self.peak_bits(length_bits + advance_input_bits + 1) >> advance_input_bits;
                 let length = LEN_BASE[symbol - 257] + bits as usize;
 
                 // Zero is the only valid distance code (corresponding to a distance of 1 byte).
                 if (bits >> length_bits) != 0 {
-                    panic!();
                     return Err(DecompressionError::CorruptData);
                 }
 
@@ -325,7 +382,6 @@ impl Decompressor {
                 } else if let Some(last) = self.last {
                     last
                 } else {
-                    panic!();
                     return Err(DecompressionError::CorruptData);
                 };
 
@@ -376,14 +432,6 @@ impl Decompressor {
                 self.last = Some(output[output_index - 1])
             }
             let input_left = remaining_input.len();
-
-            // if self.done {
-            //     self.input_data.extend_from_slice(input);
-            //     // std::fs::write("data.bin", &self.input_data);
-            // } else {
-            //     self.input_data
-            //         .extend_from_slice(&input[..input.len() - input_left]);
-            // }
             Ok((input.len() - input_left, output_index))
         } else {
             panic!();
