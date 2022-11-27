@@ -176,25 +176,41 @@ pub(crate) fn unfilter(
                 current[i] = current[i].wrapping_add(filter_paeth(0, previous[i], 0));
             }
 
-            let mut current = current.chunks_exact_mut(bpp);
-            let mut previous = previous.chunks_exact(bpp);
+            let mut cur_chunks = current.chunks_exact_mut(bpp);
+            let mut prev_chunks = previous.chunks_exact(bpp);
+            let mut a = cur_chunks.next().unwrap();
+            let mut c = prev_chunks.next().unwrap();
 
-            let mut lprevious = current.next().unwrap();
-            let mut lpprevious = previous.next().unwrap();
-
-            for pprevious in previous {
-                let pcurrent = current.next().unwrap();
-
-                for i in 0..bpp {
-                    pcurrent[i] = pcurrent[i].wrapping_add(filter_paeth(
-                        lprevious[i],
-                        pprevious[i],
-                        lpprevious[i],
-                    ));
+            // Manually unroll the loop for common bpp values.
+            match bpp {
+                3 => {
+                    for (b, cur) in prev_chunks.zip(cur_chunks) {
+                        cur[0] = cur[0].wrapping_add(filter_paeth(a[0], b[0], c[0]));
+                        cur[1] = cur[1].wrapping_add(filter_paeth(a[1], b[1], c[1]));
+                        cur[2] = cur[2].wrapping_add(filter_paeth(a[2], b[2], c[2]));
+                        a = cur;
+                        c = b;
+                    }
                 }
-
-                lprevious = pcurrent;
-                lpprevious = pprevious;
+                4 => {
+                    for (b, cur) in prev_chunks.zip(cur_chunks) {
+                        cur[0] = cur[0].wrapping_add(filter_paeth(a[0], b[0], c[0]));
+                        cur[1] = cur[1].wrapping_add(filter_paeth(a[1], b[1], c[1]));
+                        cur[2] = cur[2].wrapping_add(filter_paeth(a[2], b[2], c[2]));
+                        cur[3] = cur[3].wrapping_add(filter_paeth(a[3], b[3], c[3]));
+                        a = cur;
+                        c = b;
+                    }
+                }
+                _ => {
+                    for (b, cur) in prev_chunks.zip(cur_chunks) {
+                        for i in 0..bpp {
+                            cur[i] = cur[i].wrapping_add(filter_paeth(a[i], b[i], c[i]));
+                        }
+                        a = cur;
+                        c = b;
+                    }
+                }
             }
 
             Ok(())

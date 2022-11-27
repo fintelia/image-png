@@ -55,8 +55,8 @@ impl Compressor {
 }
 impl Default for Compressor {
     fn default() -> Self {
-        //Compressor::FDeflate(finflate::Decompressor::new())
-        Compressor::FullZlib(DecompressorOxide::new())
+        Compressor::FDeflate(finflate::Decompressor::new())
+        //Compressor::FullZlib(DecompressorOxide::new())
     }
 }
 
