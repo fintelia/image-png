@@ -30,7 +30,7 @@ impl Compressor {
                     },
             ),
             Compressor::FDeflate(decompressor) => {
-                match decompressor.read(input, &mut output[output_position..], end_of_input) {
+                match decompressor.read(input, output, output_position, end_of_input) {
                     Ok((in_consumed, out_consumed)) if decompressor.done() => {
                         assert!(in_consumed <= input.len());
                         (TINFLStatus::Done, in_consumed, out_consumed)
@@ -38,15 +38,6 @@ impl Compressor {
                     Ok((in_consumed, out_consumed)) => {
                         assert!(in_consumed <= input.len());
                         (TINFLStatus::HasMoreOutput, in_consumed, out_consumed)
-                    }
-                    Err(fdeflate::DecompressionError::NotFDeflate) => {
-                        // fdeflate guarantees that it will detect non-fdeflate streams before
-                        // consuming any input. If that happens, sanity check that no output
-                        // has been produced and feed the same input to a full zlib decoder.
-                        assert_eq!(output_position, 0);
-
-                        *self = Compressor::FullZlib(DecompressorOxide::new());
-                        self.decompress(input, output, output_position, end_of_input)
                     }
                     Err(_) => (TINFLStatus::Failed, 0, 0),
                 }
@@ -131,11 +122,11 @@ impl ZlibStream {
         if !self.in_buffer.is_empty() {
             self.in_pos += in_consumed;
             in_consumed = 0;
-        }
 
-        if self.in_buffer.len() == self.in_pos {
-            self.in_buffer.clear();
-            self.in_pos = 0;
+            if self.in_buffer.len() == self.in_pos {
+                self.in_buffer.clear();
+                self.in_pos = 0;
+            }
         }
 
         if in_consumed == 0 {
