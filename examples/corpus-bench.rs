@@ -80,7 +80,7 @@ fn main() {
     let args = Args::parse();
 
     println!(
-        "{:45} Ratio             Encode                    Decode",
+        "{:45} Ratio             zune-png                  Decode",
         "Directory"
     );
     println!(
@@ -115,9 +115,7 @@ fn main() {
             if decoder.read_header_info().ok().map(|h| h.color_type)
                 == Some(png::ColorType::Indexed)
             {
-                decoder.set_transformations(
-                    png::Transformations::EXPAND | png::Transformations::STRIP_16,
-                );
+                continue;
             }
             let mut reader = match decoder.read_info() {
                 Ok(reader) => reader,
@@ -129,39 +127,30 @@ fn main() {
                 Err(_) => continue,
             };
             let (width, height) = (info.width, info.height);
-            let bit_depth = info.bit_depth;
-            let mut color_type = info.color_type;
 
-            // qoibench expands grayscale to RGB, so we do the same.
-            if bit_depth == png::BitDepth::Eight {
-                if color_type == png::ColorType::Grayscale {
-                    image = image.into_iter().flat_map(|v| [v, v, v, 255]).collect();
-                    color_type = png::ColorType::Rgba;
-                } else if color_type == png::ColorType::GrayscaleAlpha {
-                    image = image
-                        .chunks_exact(2)
-                        .flat_map(|v| [v[0], v[0], v[0], v[1]])
-                        .collect();
-                    color_type = png::ColorType::Rgba;
-                }
-            }
-
-            // Re-encode
             let start = std::time::Instant::now();
-            let reencoded = run_encode(&args, (width, height), color_type, bit_depth, &image);
+            zune_png::PngDecoder::new_with_options(
+                &data.as_slice(),
+                zune_core::options::DecoderOptions::new_fast()
+                    .set_max_height(usize::MAX)
+                    .set_max_width(usize::MAX)
+                    .inflate_set_confirm_adler(true)
+                    .png_set_confirm_crc(true)
+            )
+            .decode_raw()
+            .unwrap();
             let elapsed = start.elapsed().as_nanos() as u64;
 
             // And decode again
             image2.resize(image.len(), 0);
             let start2 = std::time::Instant::now();
-            run_decode(&reencoded, &mut image2);
+            run_decode(&data, &mut image2);
             let elapsed2 = start2.elapsed().as_nanos() as u64;
 
             assert_eq!(image, image2);
 
             // Stats
             dir_uncompressed += image.len();
-            dir_compressed += reencoded.len();
             dir_pixels += (width * height) as u64;
             dir_encode_time += elapsed;
             dir_decode_time += elapsed2;
