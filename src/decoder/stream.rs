@@ -11,7 +11,7 @@ use byteorder::{BigEndian, ReadBytesExt as _};
 use crc32fast::Hasher as Crc32;
 
 use super::zlib::ZlibStream;
-use crate::chunk::{self, ChunkType, IDAT, IEND, IHDR};
+use crate::chunk::{self, fcTL, ChunkType, IDAT, IEND, IHDR};
 use crate::common::{
     AnimationControl, BitDepth, BlendOp, ColorType, DisposeOp, FrameControl, Info, ParameterError,
     PixelDimensions, ScaledFloat, SourceChromaticities, Unit,
@@ -242,6 +242,7 @@ pub(crate) enum FormatErrorInner {
     BadTextEncoding(TextDecodingError),
     /// fdAT shorter than 4 bytes
     FdatShorterThanFourBytes,
+    IdatTooLate,
 }
 
 impl error::Error for DecodingError {
@@ -364,6 +365,7 @@ impl fmt::Display for FormatError {
                 }
             }
             FdatShorterThanFourBytes => write!(fmt, "fdAT chunk shorter than 4 bytes"),
+            IdatTooLate => write!(fmt, "IDAT chunk out of order"),
         }
     }
 }
@@ -477,6 +479,7 @@ pub struct StreamingDecoder {
     /// Whether we have already seen a start of an IDAT chunk.  (Used to validate chunk ordering -
     /// some chunk types can only appear before or after an IDAT chunk.)
     have_idat: bool,
+    idats_done: bool,
     decode_options: DecodeOptions,
     pub(crate) limits: Limits,
 }
@@ -515,6 +518,7 @@ impl StreamingDecoder {
             info: None,
             current_seq_no: None,
             have_idat: false,
+            idats_done: false,
             decode_options,
             limits: Limits { bytes: usize::MAX },
         }
@@ -530,6 +534,7 @@ impl StreamingDecoder {
         self.info = None;
         self.current_seq_no = None;
         self.have_idat = false;
+        self.idats_done = false;
     }
 
     /// Provides access to the inner `info` field
@@ -571,6 +576,12 @@ impl StreamingDecoder {
     pub fn set_skip_ancillary_crc_failures(&mut self, skip_ancillary_crc_failures: bool) {
         self.decode_options
             .set_skip_ancillary_crc_failures(skip_ancillary_crc_failures)
+    }
+
+    fn start_chunk<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
+        self.current_chunk.remaining = reader.read_u32::<BigEndian>()?;
+        reader.read_exact(&mut self.current_chunk.type_.0)?;
+        Ok(())
     }
 
     fn read_chunk<R: BufRead>(
@@ -640,9 +651,10 @@ impl StreamingDecoder {
     }
 
     pub fn read_metadata<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
+        assert!(!self.have_idat); // TODO: should we require this?
+
         loop {
-            self.current_chunk.remaining = reader.read_u32::<BigEndian>()?;
-            reader.read_exact(&mut self.current_chunk.type_.0)?;
+            self.start_chunk(&mut reader)?;
             if self.current_chunk.type_ == IDAT {
                 self.have_idat = true;
                 break;
@@ -674,25 +686,41 @@ impl StreamingDecoder {
             ));
         }
 
+        if self.current_chunk.type_ == fcTL {
+            self.read_chunk(
+                &mut reader,
+                self.current_chunk.remaining,
+                self.current_chunk.type_,
+            )?;
+            self.start_chunk(&mut reader)?;
+            self.current_chunk.raw_bytes.clear();
+        }
+
         let target_output_size = image_data.len() + (256 << 10);
 
         'outer: while image_data.len() < target_output_size
             && (self.current_chunk.type_ == IDAT || self.current_chunk.type_ == chunk::fdAT)
         {
             if self.current_chunk.remaining == 0 {
-                let _crc = reader.read_u32::<BigEndian>()?;
+                let _crc = reader.read_u32::<BigEndian>()?; // TODO: validate CRC
                 loop {
-                    self.current_chunk.remaining = reader.read_u32::<BigEndian>()?;
-                    reader.read_exact(&mut self.current_chunk.type_.0)?;
+                    self.start_chunk(&mut reader)?;
                     match self.current_chunk.type_ {
+                        chunk::IDAT if self.idats_done => {
+                            return Err(DecodingError::Format(
+                                FormatErrorInner::IdatTooLate.into(),
+                            ));
+                        }
                         chunk::IDAT => break,
                         chunk::IEND => break 'outer,
-                        chunk::fdAT => todo!(),
-                        chunk::fcTL => {
+                        chunk::fdAT => {
+                            if self.current_chunk.remaining < 4 {
+                                return Err(DecodingError::Format(
+                                    FormatErrorInner::FdatShorterThanFourBytes.into(),
+                                ));
+                            }
                             let seq = reader.read_u32::<BigEndian>()?;
-                            if self.current_seq_no.is_none()
-                                || self.current_seq_no.as_ref().unwrap().saturating_add(1) != seq
-                            {
+                            if seq == 0 || self.current_seq_no != Some(seq - 1) {
                                 return Err(DecodingError::Format(
                                     FormatErrorInner::ApngOrder {
                                         present: seq,
@@ -704,7 +732,12 @@ impl StreamingDecoder {
                                     .into(),
                                 ));
                             }
+                            self.current_seq_no = Some(seq);
                             break;
+                        }
+                        chunk::fcTL => {
+                            self.idats_done = true;
+                            break 'outer;
                         }
                         _ => {
                             self.read_chunk(
@@ -1062,6 +1095,9 @@ impl StreamingDecoder {
             chunk::tEXt if !self.decode_options.ignore_text_chunk => self.parse_text(),
             chunk::zTXt if !self.decode_options.ignore_text_chunk => self.parse_ztxt(),
             chunk::iTXt if !self.decode_options.ignore_text_chunk => self.parse_itxt(),
+            chunk::fdAT if !self.have_idat => Err(DecodingError::Format(
+                FormatErrorInner::MissingImageData.into(), // TODO: Is this the right error?
+            )),
             _ => Ok(Decoded::PartialChunk(type_str)),
         } {
             Err(err) => {
@@ -1978,7 +2014,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_fdat_chunk_payload_length_0() {
         let mut png = Vec::new();
         write_fdat_prefix(&mut png, 2, 8);
@@ -1997,7 +2032,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_fdat_chunk_payload_length_3() {
         let mut png = Vec::new();
         write_fdat_prefix(&mut png, 2, 8);
@@ -2016,7 +2050,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_frame_split_across_two_fdat_chunks() {
         // Generate test data where the 2nd animation frame is split across 2 fdAT chunks.
         //
@@ -2088,7 +2121,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
     fn test_idat_bigger_than_image_size_from_ihdr() {
         let png = {
             let mut png = Vec::new();

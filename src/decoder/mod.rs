@@ -383,7 +383,7 @@ impl<R: BufRead> Reader<R> {
             ));
         } else if self.next_frame != subframe_idx {
             // Advance until we've read the info / fcTL for this frame.
-            self.read_until_image_data()?;
+            // self.read_until_image_data()?;
         }
 
         if buf.len() < self.output_buffer_size() {

@@ -52,3 +52,6 @@ path = "benches/unfilter.rs"
 name = "unfilter"
 harness = false
 required-features = ["benchmarks"]
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(fuzzing)'] }
