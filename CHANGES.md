@@ -1,4 +1,35 @@
-## Unreleased
+## 0.17.14
+
+* Updated to miniz_oxide 0.8.0.
+* Added public API to consume interlaced rows one by one ([#495])
+* Improved support for resuming decoding after an `UnexpectedEof`, which lets you start parsing a file before it's fully received over the network ([#496])
+* Fixed some broken links in documentation, improved some documentation comments
+
+[#495]: https://github.com/image-rs/image-png/pull/495
+[#496]: https://github.com/image-rs/image-png/pull/496
+
+
+## 0.17.13
+
+* Fix `Send` bound on `Reader`.
+
+## 0.17.12
+
+* Reject zero-sized frames.
+* Optimized decoding of paletted images.
+* Removed remaining uses of miniz_oxide for decoding.
+* Correct lifetime used for `Info` struct.
+* Fix build issue with `-Z minimal-versions`.
+
+## 0.17.11
+
+* Ignore subsequent iCCP chunks to match libpng behavior.
+* Added an option to ignore ancillary chunks with invalid CRC.
+* Added `new_with_info` constructor for encoder.
+* Removed hard-coded memory limits.
+* No longer allow zero sized images.
+* Added `Reader::finish` to read all the auxiliary chunks that comes after the
+  image.
 
 ## 0.17.10
 

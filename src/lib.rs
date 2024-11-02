@@ -4,9 +4,9 @@
 //!
 //! ## The decoder
 //!
-//! The most important types for decoding purposes are [`Decoder`](struct.Decoder.html) and
-//! [`Reader`](struct.Reader.html). They both wrap a `std::io::Read`.
-//! `Decoder` serves as a builder for `Reader`. Calling `Decoder::read_info` reads from the `Read` until the
+//! The most important types for decoding purposes are [`Decoder`] and
+//! [`Reader`]. They both wrap a [`std::io::Read`].
+//! `Decoder` serves as a builder for `Reader`. Calling [`Decoder::read_info`] reads from the `Read` until the
 //! image data is reached.
 //!
 //! ### Using the decoder
@@ -61,9 +61,7 @@
 #![cfg_attr(feature = "unstable", feature(portable_simd))]
 #![forbid(unsafe_code)]
 
-#[macro_use]
-extern crate bitflags;
-
+mod adam7;
 pub mod chunk;
 mod common;
 mod decoder;
@@ -72,12 +70,12 @@ mod filter;
 mod srgb;
 pub mod text_metadata;
 mod traits;
-mod utils;
 
+pub use crate::adam7::expand_pass as expand_interlaced_row;
+pub use crate::adam7::Adam7Info;
 pub use crate::common::*;
-pub use crate::decoder::{
-    DecodeOptions, Decoded, Decoder, DecodingError, Limits, OutputInfo, Reader, StreamingDecoder,
-};
+pub use crate::decoder::stream::{DecodeOptions, Decoded, DecodingError, StreamingDecoder};
+pub use crate::decoder::{Decoder, InterlaceInfo, InterlacedRow, Limits, OutputInfo, Reader};
 pub use crate::encoder::{Encoder, EncodingError, StreamWriter, Writer};
 pub use crate::filter::{AdaptiveFilterType, FilterType};
 
