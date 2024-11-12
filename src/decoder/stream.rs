@@ -667,7 +667,9 @@ impl StreamingDecoder {
             }
         }
 
-        self.parse_chunk(chunk_type)?;
+        if chunk_type != chunk::IDAT && chunk_type != chunk::fdAT && chunk_type != chunk::IEND {
+            self.parse_chunk(chunk_type)?;
+        }
         Ok(())
     }
 
@@ -695,7 +697,9 @@ impl StreamingDecoder {
     }
 
     pub fn read_metadata<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
-        assert!(!self.have_idat); // TODO: should we require this?
+        if self.have_idat {
+            return Ok(());
+        }
 
         loop {
             self.start_chunk(&mut reader)?;
@@ -725,7 +729,9 @@ impl StreamingDecoder {
         }
 
         if self.current_chunk.type_ == IEND {
-            return Err(DecodingError::Format(todo!()));
+            return Err(DecodingError::Format(
+                FormatErrorInner::NoMoreImageData.into(),
+            ));
         }
 
         if self.current_chunk.type_ == fcTL {
@@ -762,6 +768,7 @@ impl StreamingDecoder {
                                 ));
                             }
                             let seq = reader.read_u32::<BigEndian>()?;
+                            self.current_chunk.remaining -= 4;
                             if seq == 0 || self.current_seq_no != Some(seq - 1) {
                                 return Err(DecodingError::Format(
                                     FormatErrorInner::ApngOrder {
@@ -796,7 +803,7 @@ impl StreamingDecoder {
 
             let buf = reader.fill_buf()?;
             if buf.len() == 0 {
-                return Err(DecodingError::Format(todo!()));
+                return Ok(ImageDataCompletionStatus::ExpectingMoreData);
             }
 
             let input_bytes = buf
@@ -808,12 +815,28 @@ impl StreamingDecoder {
             reader.consume(consumed);
         }
 
-        if self.current_chunk.type_ != IDAT && self.current_chunk.type_ != chunk::fdAT{
+        if self.current_chunk.type_ != IDAT && self.current_chunk.type_ != chunk::fdAT {
             self.inflater.finish_compressed_chunks(image_data)?;
             Ok(ImageDataCompletionStatus::Done)
         } else {
             Ok(ImageDataCompletionStatus::ExpectingMoreData)
         }
+    }
+
+    pub fn read_until_end_of_input<R: BufRead>(
+        &mut self,
+        mut reader: R,
+    ) -> Result<(), DecodingError> {
+        while self.current_chunk.type_ != IEND {
+            self.read_chunk(
+                &mut reader,
+                self.current_chunk.remaining,
+                self.current_chunk.type_,
+            )?;
+            self.start_chunk(&mut reader)?;
+        }
+
+        Ok(())
     }
 
     /// Low level StreamingDecoder interface.

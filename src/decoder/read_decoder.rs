@@ -58,30 +58,13 @@ impl<R: BufRead> ReadDecoder<R> {
         self.decoder.set_ignore_crc(ignore_checksums);
     }
 
-    /// Returns the next decoded chunk. If the chunk is an ImageData chunk, its contents are written
-    /// into image_data.
-    fn decode_next(&mut self, image_data: &mut Vec<u8>) -> Result<Decoded, DecodingError> {
-        let (consumed, result) = {
-            let buf = self.reader.fill_buf()?;
-            if buf.is_empty() {
-                return Err(DecodingError::IoError(ErrorKind::UnexpectedEof.into()));
-            }
-            self.decoder.update(buf, image_data)?
-        };
-        self.reader.consume(consumed);
-        Ok(result)
-    }
-
-    fn decode_next_and_discard_image_data(&mut self) -> Result<Decoded, DecodingError> {
-        let mut to_be_discarded = Vec::new();
-        self.decode_next(&mut to_be_discarded)
-    }
-
     /// Reads until the end of `IHDR` chunk.
     ///
     /// Prerequisite: None (idempotent).
     pub fn read_header_info(&mut self) -> Result<&Info<'static>, DecodingError> {
-        self.decoder.read_ihdr(&mut self.reader)?;
+        if self.decoder.info.is_none() {
+            self.decoder.read_ihdr(&mut self.reader)?;
+        }
         Ok(self.info().unwrap())
     }
 
@@ -119,11 +102,7 @@ impl<R: BufRead> ReadDecoder<R> {
     ///
     /// Prerequisite: `IEND` chunk hasn't been reached yet.
     pub fn read_until_end_of_input(&mut self) -> Result<(), DecodingError> {
-        while !matches!(
-            self.decode_next_and_discard_image_data()?,
-            Decoded::ImageEnd
-        ) {}
-        Ok(())
+        self.decoder.read_until_end_of_input(&mut self.reader)
     }
 
     pub fn info(&self) -> Option<&Info<'static>> {

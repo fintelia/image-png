@@ -185,7 +185,7 @@ impl<R: BufRead> Decoder<R> {
 
     /// Reads all meta data until the first IDAT chunk
     pub fn read_info(mut self) -> Result<Reader<R>, DecodingError> {
-        // self.read_header_info()?; // TODO: Fix this!!!
+        self.read_header_info()?;
 
         let mut reader = Reader {
             decoder: self.read_decoder,
