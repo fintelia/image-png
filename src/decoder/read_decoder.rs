@@ -1,6 +1,4 @@
-use super::stream::{
-    DecodeOptions, DecodingError, StreamingDecoder,
-};
+use super::stream::{DecodeOptions, DecodingError, StreamingDecoder};
 use super::Limits;
 
 use std::io::{BufRead, Read, Seek};

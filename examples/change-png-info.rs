@@ -1,7 +1,7 @@
 /// Tests "editing"/re-encoding of an image:
 /// decoding, editing, re-encoding
 use std::fs::File;
-use std::io::{BufWriter, BufReader};
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 pub type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 

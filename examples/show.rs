@@ -8,7 +8,13 @@ use glium::{
     texture::{ClientFormat, RawImage2d},
     BlitTarget, Rect, Surface,
 };
-use std::{borrow::Cow, env, fs::File, io::{self, BufReader}, path};
+use std::{
+    borrow::Cow,
+    env,
+    fs::File,
+    io::{self, BufReader},
+    path,
+};
 
 /// Load the image using `png`
 fn load_image(path: &path::PathBuf) -> io::Result<RawImage2d<'static, u8>> {
