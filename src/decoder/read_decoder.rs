@@ -1,11 +1,10 @@
 use super::stream::{
-    DecodeOptions, Decoded, DecodingError, FormatErrorInner, StreamingDecoder, CHUNK_BUFFER_SIZE,
+    DecodeOptions, DecodingError, StreamingDecoder,
 };
 use super::Limits;
 
-use std::io::{BufRead, BufReader, ErrorKind, Read};
+use std::io::{BufRead, Read, Seek};
 
-use crate::chunk;
 use crate::common::Info;
 
 /// Helper for encapsulating reading input from `Read` and feeding it into a `StreamingDecoder`
@@ -22,7 +21,7 @@ pub(crate) struct ReadDecoder<R: Read> {
     decoder: StreamingDecoder,
 }
 
-impl<R: BufRead> ReadDecoder<R> {
+impl<R: BufRead + Seek> ReadDecoder<R> {
     pub fn new(r: R) -> Self {
         Self {
             reader: r,

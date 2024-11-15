@@ -1727,7 +1727,7 @@ mod tests {
                     encoder.write_image_data(&buf).unwrap();
                 }
                 // Decode encoded decoded image
-                let decoder = Decoder::new(&*out);
+                let decoder = Decoder::new(Cursor::new(&*out));
                 let mut reader = decoder.read_info().unwrap();
                 let mut buf2 = vec![0; reader.output_buffer_size()];
                 reader.next_frame(&mut buf2).unwrap();
@@ -1779,7 +1779,7 @@ mod tests {
                     outer_wrapper.write_all(&buf).unwrap();
                 }
                 // Decode encoded decoded image
-                let decoder = Decoder::new(&*out);
+                let decoder = Decoder::new(Cursor::new(&*out));
                 let mut reader = decoder.read_info().unwrap();
                 let mut buf2 = vec![0; reader.output_buffer_size()];
                 reader.next_frame(&mut buf2).unwrap();
@@ -1819,7 +1819,7 @@ mod tests {
             }
 
             // Decode re-encoded image
-            let decoder = Decoder::new(&*out);
+            let decoder = Decoder::new(Cursor::new(&*out));
             let mut reader = decoder.read_info().unwrap();
             let mut redecoded = vec![0; reader.output_buffer_size()];
             reader.next_frame(&mut redecoded).unwrap();

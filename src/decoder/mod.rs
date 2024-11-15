@@ -8,7 +8,7 @@ use self::read_decoder::{ImageDataCompletionStatus, ReadDecoder};
 use self::stream::{DecodeOptions, DecodingError, FormatErrorInner, CHUNK_BUFFER_SIZE};
 use self::transform::{create_transform_fn, TransformFn};
 
-use std::io::BufRead;
+use std::io::{BufRead, Seek};
 use std::mem;
 
 use crate::adam7::{self, Adam7Info};
@@ -120,7 +120,7 @@ impl<'data> Row<'data> {
     }
 }
 
-impl<R: BufRead> Decoder<R> {
+impl<R: BufRead + Seek> Decoder<R> {
     /// Create a new decoder configuration with default limits.
     pub fn new(r: R) -> Decoder<R> {
         Decoder::new_with_limits(r, Limits::default())
@@ -322,7 +322,7 @@ struct SubframeInfo {
     consumed_and_flushed: bool,
 }
 
-impl<R: BufRead> Reader<R> {
+impl<R: BufRead + Seek> Reader<R> {
     /// Advances to the start of the next animation frame and
     /// returns a reference to the `FrameControl` info that describes it.
     /// Skips and discards the image data of the previous frame if necessary.

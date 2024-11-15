@@ -1,6 +1,7 @@
 use std::convert::TryInto;
 use std::error;
 use std::fmt;
+use std::io::Seek;
 use std::io::{self, BufRead, Read};
 use std::{borrow::Cow, cmp::min};
 
@@ -519,6 +520,9 @@ pub struct StreamingDecoder {
     have_iccp: bool,
     decode_options: DecodeOptions,
     pub(crate) limits: Limits,
+
+    stream_position: u64,
+    hit_eof: bool,
 }
 
 struct ChunkState {
@@ -561,6 +565,8 @@ impl StreamingDecoder {
             ready_for_fdat_chunks: false,
             decode_options,
             limits: Limits { bytes: usize::MAX },
+            stream_position: 0,
+            hit_eof: false,
         }
     }
 
@@ -622,9 +628,26 @@ impl StreamingDecoder {
             .set_skip_ancillary_crc_failures(skip_ancillary_crc_failures)
     }
 
+    fn read_u32<R: Read>(&mut self, mut reader: R) -> Result<u32, DecodingError> {
+        match reader.read_u32::<BigEndian>() {
+            Ok(val) => Ok(val),
+            Err(err) => {
+                if err.kind() == io::ErrorKind::UnexpectedEof {
+                    self.hit_eof = true;
+                }
+                Err(err.into())
+            }
+        }
+    }
+
     fn start_chunk<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
-        self.current_chunk.remaining = reader.read_u32::<BigEndian>()?;
-        reader.read_exact(&mut self.current_chunk.type_.0)?;
+        self.current_chunk.remaining = self.read_u32(&mut reader)?;
+        if let Err(e) = reader.read_exact(&mut self.current_chunk.type_.0) {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                self.hit_eof = true;
+            }
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -639,12 +662,13 @@ impl StreamingDecoder {
             .take(length as u64)
             .read_to_end(&mut self.current_chunk.raw_bytes)?;
         if self.current_chunk.raw_bytes.len() < length as usize {
+            self.hit_eof = true;
             return Err(DecodingError::Format(
                 FormatErrorInner::ChunkTooShort { kind: chunk_type }.into(),
             ));
         }
 
-        let crc = reader.read_u32::<BigEndian>()?;
+        let crc = self.read_u32(&mut reader)?;
         if !self.decode_options.ignore_crc {
             self.current_chunk.crc.reset();
             self.current_chunk.crc.update(&chunk_type.0);
@@ -667,13 +691,15 @@ impl StreamingDecoder {
             }
         }
 
+        self.stream_position += 12 + length as u64;
         if chunk_type != chunk::IDAT && chunk_type != chunk::fdAT && chunk_type != chunk::IEND {
             self.parse_chunk(chunk_type)?;
         }
+
         Ok(())
     }
 
-    pub fn read_ihdr<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
+    pub fn read_ihdr<R: BufRead + Seek>(&mut self, mut reader: R) -> Result<(), DecodingError> {
         let mut signature = [0u8; 8];
         reader.read_exact(&mut signature)?;
         if signature != [137, 80, 78, 71, 13, 10, 26, 10] {
@@ -681,6 +707,8 @@ impl StreamingDecoder {
                 FormatErrorInner::InvalidSignature.into(),
             ));
         }
+
+        self.stream_position = reader.stream_position()?;
 
         let length = reader.read_u32::<BigEndian>()?;
         let mut chunk_type = ChunkType([0u8; 4]);
@@ -691,14 +719,19 @@ impl StreamingDecoder {
             ));
         }
 
-        self.read_chunk(reader, length, chunk_type)?;
+        self.read_chunk(&mut reader, length, chunk_type)?;
 
         Ok(())
     }
 
-    pub fn read_metadata<R: BufRead>(&mut self, mut reader: R) -> Result<(), DecodingError> {
+    pub fn read_metadata<R: BufRead + Seek>(&mut self, mut reader: R) -> Result<(), DecodingError> {
         if self.have_idat {
             return Ok(());
+        }
+
+        if self.hit_eof {
+            reader.seek(io::SeekFrom::Start(self.stream_position))?;
+            self.hit_eof = false;
         }
 
         loop {
@@ -717,7 +750,7 @@ impl StreamingDecoder {
         Ok(())
     }
 
-    pub fn read_image_data<R: BufRead>(
+    pub fn read_image_data<R: BufRead + Seek>(
         &mut self,
         mut reader: R,
         image_data: &mut Vec<u8>,
@@ -734,41 +767,61 @@ impl StreamingDecoder {
             ));
         }
 
-        if self.current_chunk.type_ == fcTL {
+        if self.hit_eof {
+            reader.seek(io::SeekFrom::Start(self.stream_position))?;
+            self.hit_eof = false;
+        }
+
+        while self.current_chunk.type_ != IDAT && self.current_chunk.type_ != chunk::fdAT {
             self.read_chunk(
                 &mut reader,
                 self.current_chunk.remaining,
                 self.current_chunk.type_,
             )?;
+            if self.current_chunk.type_ == IEND {
+                return Err(DecodingError::Format(
+                    FormatErrorInner::NoMoreImageData.into(),
+                ));
+            }
             self.start_chunk(&mut reader)?;
-            self.current_chunk.raw_bytes.clear();
         }
 
         let target_output_size = image_data.len() + (256 << 10);
-
-        'outer: while image_data.len() < target_output_size
-            && (self.current_chunk.type_ == IDAT || self.current_chunk.type_ == chunk::fdAT)
-        {
+        'outer: while image_data.len() < target_output_size {
             if self.current_chunk.remaining == 0 {
-                let _crc = reader.read_u32::<BigEndian>()?; // TODO: validate CRC
+                let _crc = self.read_u32(&mut reader)?; // TODO: validate CRC
+                self.start_chunk(&mut reader)?;
+                self.stream_position += 12;
+
+                // Loop until we get to the start of the next IDAT or fdAT chunk.
                 loop {
-                    self.start_chunk(&mut reader)?;
                     match self.current_chunk.type_ {
-                        chunk::IDAT if self.idats_done => {
-                            return Err(DecodingError::Format(
-                                FormatErrorInner::IdatTooLate.into(),
-                            ));
+                        chunk::IDAT => {
+                            if self.idats_done {
+                                return Err(DecodingError::Format(
+                                    FormatErrorInner::IdatTooLate.into(),
+                                ));
+                            }
+
+                            break;
                         }
-                        chunk::IDAT => break,
-                        chunk::IEND => break 'outer,
+                        chunk::IEND => {
+                            self.read_chunk(
+                                reader,
+                                self.current_chunk.remaining,
+                                self.current_chunk.type_,
+                            )?;
+                            break 'outer;
+                        }
                         chunk::fdAT => {
                             if self.current_chunk.remaining < 4 {
                                 return Err(DecodingError::Format(
                                     FormatErrorInner::FdatShorterThanFourBytes.into(),
                                 ));
                             }
-                            let seq = reader.read_u32::<BigEndian>()?;
+                            let seq = self.read_u32(&mut reader)?;
                             self.current_chunk.remaining -= 4;
+                            self.stream_position += 4;
                             if seq == 0 || self.current_seq_no != Some(seq - 1) {
                                 return Err(DecodingError::Format(
                                     FormatErrorInner::ApngOrder {
@@ -789,13 +842,18 @@ impl StreamingDecoder {
                             break 'outer;
                         }
                         _ => {
+                            let previous_stream_position = self.stream_position;
                             self.read_chunk(
                                 &mut reader,
                                 self.current_chunk.remaining,
                                 self.current_chunk.type_,
                             )?;
-                            self.current_chunk.raw_bytes.clear();
-                            self.current_chunk.remaining = 0;
+
+                            let next_stream_position = self.stream_position + 8;
+                            self.stream_position = previous_stream_position;
+
+                            self.start_chunk(&mut reader)?;
+                            self.stream_position = next_stream_position;
                         }
                     }
                 }
@@ -813,6 +871,7 @@ impl StreamingDecoder {
             let consumed = self.inflater.decompress(&buf[..input_bytes], image_data)?;
             self.current_chunk.remaining -= consumed as u32;
             reader.consume(consumed);
+            self.stream_position += consumed as u64;
         }
 
         if self.current_chunk.type_ != IDAT && self.current_chunk.type_ != chunk::fdAT {
@@ -1938,6 +1997,8 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs::File;
     use std::io::BufRead;
+    use std::io::Cursor;
+    use std::io::Seek;
     use std::io::{BufReader, ErrorKind, Read, Write};
     use std::rc::Rc;
 
@@ -2240,7 +2301,7 @@ mod tests {
     fn test_finishing_twice() {
         let mut png = Vec::new();
         write_noncompressed_png(&mut png, 16, 1024);
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
 
         // First call to `finish` - expecting success.
@@ -2328,7 +2389,7 @@ mod tests {
         write_fdat_prefix(&mut png, 2, 8);
         write_chunk(&mut png, b"fdAT", &[]);
 
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
         reader.next_frame(&mut buf).unwrap();
@@ -2356,7 +2417,7 @@ mod tests {
         write_fdat_prefix(&mut png, 2, 8);
         write_chunk(&mut png, b"fdAT", &[1, 0, 0]);
 
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
         reader.next_frame(&mut buf).unwrap();
@@ -2394,7 +2455,7 @@ mod tests {
         };
 
         // Start decoding.
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
         let Some(animation_control) = reader.info().animation_control else {
@@ -2457,7 +2518,7 @@ mod tests {
             write_iend(&mut png);
             png
         };
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
 
@@ -2475,7 +2536,7 @@ mod tests {
             write_chunk(&mut png, b"IDAT", &[]);
             png
         };
-        let decoder = Decoder::new(png.as_slice());
+        let decoder = Decoder::new(Cursor::new(&png));
         let Err(err) = decoder.read_info() else {
             panic!("Expected an error")
         };
@@ -2544,9 +2605,9 @@ mod tests {
 
         fn decode_full_input<F, R>(&self, f: F) -> R
         where
-            F: FnOnce(Reader<&[u8]>) -> R,
+            F: FnOnce(Reader<Cursor<&[u8]>>) -> R,
         {
-            let decoder = Decoder::new(self.full_input.as_slice());
+            let decoder = Decoder::new(Cursor::new(&*self.full_input));
             f(decoder.read_info().unwrap())
         }
     }
@@ -2571,6 +2632,20 @@ mod tests {
             let mut state = self.state.borrow_mut();
             state.current_pos += amt;
             assert!(state.current_pos <= state.available_len);
+        }
+    }
+    impl Seek for StreamingInput {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            let mut state = self.state.borrow_mut();
+            state.current_pos = match pos {
+                std::io::SeekFrom::Start(n) => n as usize,
+                std::io::SeekFrom::End(n) => (self.full_input.len() as i64 + n) as usize,
+                std::io::SeekFrom::Current(n) => (state.current_pos as i64 + n) as usize,
+            } as usize;
+            Ok(state.current_pos as u64)
+        }
+        fn stream_position(&mut self) -> std::io::Result<u64> {
+            Ok(self.state.borrow().current_pos as u64)
         }
     }
 
@@ -2678,15 +2753,15 @@ mod tests {
 
     /// Creates a ready-to-test [`Reader`] which decodes a PNG that contains:
     /// IHDR, IDAT, IEND.
-    fn create_reader_of_ihdr_idat() -> Reader<VecDeque<u8>> {
-        let mut png = VecDeque::new();
+    fn create_reader_of_ihdr_idat() -> Reader<Cursor<Vec<u8>>> {
+        let mut png = Vec::new();
         write_noncompressed_png(&mut png, /* width = */ 16, /* idat_size = */ 1024);
-        Decoder::new(png).read_info().unwrap()
+        Decoder::new(Cursor::new(png)).read_info().unwrap()
     }
 
     /// Creates a ready-to-test [`Reader`] which decodes an animated PNG that contains:
     /// IHDR, acTL, fcTL, IDAT, fcTL, fdAT, IEND.  (i.e. IDAT is part of the animation)
-    fn create_reader_of_ihdr_actl_fctl_idat_fctl_fdat() -> Reader<VecDeque<u8>> {
+    fn create_reader_of_ihdr_actl_fctl_idat_fctl_fdat() -> Reader<Cursor<Vec<u8>>> {
         let width = 16;
         let frame_data = generate_rgba8_with_width_and_height(width, width);
         let mut fctl = crate::FrameControl {
@@ -2695,7 +2770,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut png = VecDeque::new();
+        let mut png = Vec::new();
         write_png_sig(&mut png);
         write_rgba8_ihdr_with_width(&mut png, width);
         write_actl(
@@ -2713,12 +2788,12 @@ mod tests {
         write_fdat(&mut png, 2, &frame_data);
         write_iend(&mut png);
 
-        Decoder::new(png).read_info().unwrap()
+        Decoder::new(Cursor::new(png)).read_info().unwrap()
     }
 
     /// Creates a ready-to-test [`Reader`] which decodes an animated PNG that contains: IHDR, acTL,
     /// IDAT, fcTL, fdAT, fcTL, fdAT, IEND.  (i.e. IDAT is *not* part of the animation)
-    fn create_reader_of_ihdr_actl_idat_fctl_fdat_fctl_fdat() -> Reader<VecDeque<u8>> {
+    fn create_reader_of_ihdr_actl_idat_fctl_fdat_fctl_fdat() -> Reader<Cursor<Vec<u8>>> {
         let width = 16;
         let frame_data = generate_rgba8_with_width_and_height(width, width);
         let mut fctl = crate::FrameControl {
@@ -2727,7 +2802,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut png = VecDeque::new();
+        let mut png = Vec::new();
         write_png_sig(&mut png);
         write_rgba8_ihdr_with_width(&mut png, width);
         write_actl(
@@ -2746,10 +2821,10 @@ mod tests {
         write_fdat(&mut png, 3, &frame_data);
         write_iend(&mut png);
 
-        Decoder::new(png).read_info().unwrap()
+        Decoder::new(Cursor::new(png)).read_info().unwrap()
     }
 
-    fn get_fctl_sequence_number(reader: &Reader<impl BufRead>) -> u32 {
+    fn get_fctl_sequence_number(reader: &Reader<impl BufRead + Seek>) -> u32 {
         reader
             .info()
             .frame_control
