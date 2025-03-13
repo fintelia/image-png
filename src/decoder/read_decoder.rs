@@ -108,7 +108,7 @@ impl<R: BufRead + Seek> ReadDecoder<R> {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub enum ImageDataCompletionStatus {
+pub(crate) enum ImageDataCompletionStatus {
     ExpectingMoreData,
     Done,
 }

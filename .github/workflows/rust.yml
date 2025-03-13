@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rust: ["1.57.0", stable, beta, nightly]
+        rust: ["1.65.0", stable, beta, nightly]
         os: [ubuntu-latest, windows-latest, macos-latest]
         features: [""]
     runs-on: ${{ matrix.os }}
@@ -17,9 +17,9 @@ jobs:
     - uses: actions/checkout@v4
 
     - uses: dtolnay/rust-toolchain@nightly
-      if: ${{ matrix.rust == '1.57.0' }}
+      if: ${{ matrix.rust == '1.65.0' }}
     - name: Generate Cargo.lock with minimal-version dependencies
-      if: ${{ matrix.rust == '1.57.0' }}
+      if: ${{ matrix.rust == '1.65.0' }}
       run: cargo -Zminimal-versions generate-lockfile
 
     - uses: actions-rs/toolchain@v1
@@ -32,8 +32,9 @@ jobs:
   feature_check:
     strategy:
       matrix:
-        features: ["", "benchmarks"]
-    runs-on: ubuntu-latest
+        features: ["", "unstable", "benchmarks"]
+        os: [ubuntu-latest, macos-latest] # macos-latest is ARM
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
     - uses: actions-rs/toolchain@v1
@@ -46,15 +47,36 @@ jobs:
       env:
         FEATURES: ${{ matrix.features }}
   powerpc_cross:
+    # github actions does not support big endian systems directly, but it does support QEMU.
+    # so we install qemu, then build and run the tests in an emulated powerpc system.
+    # note: you can also use this approach to test for big endian locally.
     runs-on: ubuntu-latest
+
+    # we are using the cross project for cross compilation:
+    # https://github.com/cross-rs/cross
     steps:
-    - uses: actions/checkout@v4
-    - name: add_cross_target
-      run: |
-        rustup target add powerpc-unknown-linux-gnu
-        cargo build --target powerpc-unknown-linux-gnu
+      - uses: actions/checkout@v4
+
+      - name: Install or use cached cross-rs/cross
+        uses: baptiste0928/cargo-install@v1
+        with:
+          crate: cross
+
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+
+      - name: Start Docker (required for cross-rs)
+        run: sudo systemctl start docker
+
+      - name: Cross-Run Tests in powerpc-unknown-linux-gnu using Qemu
+        run: cross test --release --target powerpc-unknown-linux-gnu --verbose -v
   test_all:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest] # macos-latest is ARM
+    runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v4
     - run: rustup default stable
