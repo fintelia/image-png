@@ -775,7 +775,7 @@ impl<W: Write> Writer<W> {
         let zlib_encoded = match self.options.compression {
             DeflateCompression::NoCompression => {
                 let mut compressor =
-                    fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
+                    fdeflate::Compressor::new(std::io::Cursor::new(Vec::new()), 0, true)?;
                 for line in data.chunks(in_len) {
                     compressor.write_data(&[0])?;
                     compressor.write_data(line)?;
@@ -783,7 +783,8 @@ impl<W: Write> Writer<W> {
                 compressor.finish()?.into_inner()
             }
             DeflateCompression::FdeflateUltraFast => {
-                let mut compressor = fdeflate::Compressor::new(std::io::Cursor::new(Vec::new()))?;
+                let mut compressor =
+                    fdeflate::UltraFastCompressor::new(std::io::Cursor::new(Vec::new()))?;
 
                 let mut current = vec![0; in_len + 1];
                 for line in data.chunks(in_len) {
@@ -795,36 +796,40 @@ impl<W: Write> Writer<W> {
                 }
 
                 let compressed = compressor.finish()?.into_inner();
-                if compressed.len()
-                    > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
-                {
-                    // Write uncompressed data since the result from fast compression would take
-                    // more space than that.
-                    //
-                    // This is essentially a fallback to NoCompression.
-                    let mut compressor =
-                        fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
-                    for line in data.chunks(in_len) {
-                        compressor.write_data(&[0])?;
-                        compressor.write_data(line)?;
-                    }
-                    compressor.finish()?.into_inner()
-                } else {
-                    compressed
-                }
+                // if compressed.len()
+                //     > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
+                // {
+                //     // Write uncompressed data since the result from fast compression would take
+                //     // more space than that.
+                //     //
+                //     // This is essentially a fallback to NoCompression.
+                //     let mut compressor =
+                //         fdeflate::StoredOnlyCompressor::new(std::io::Cursor::new(Vec::new()))?;
+                //     for line in data.chunks(in_len) {
+                //         compressor.write_data(&[0])?;
+                //         compressor.write_data(line)?;
+                //     }
+                //     compressor.finish()?.into_inner()
+                // } else {
+                compressed
+                // }
             }
             DeflateCompression::Level(level) => {
                 let mut current = vec![0; in_len];
 
-                let mut zlib =
-                    ZlibEncoder::new(Vec::new(), flate2::Compression::new(u32::from(level)));
+                let mut zlib = fdeflate::Compressor::new(Vec::new(), 1, true)?;
+                let mut input = Vec::new();
+                //ZlibEncoder::new(Vec::new(), flate2::Compression::new(u32::from(level)));
                 for line in data.chunks(in_len) {
                     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
 
-                    zlib.write_all(&[filter_type as u8])?;
-                    zlib.write_all(&current)?;
+                    // zlib.write_data(&[filter_type as u8])?;
+                    // zlib.write_data(&current)?;
+                    input.push(filter_type as u8);
+                    input.extend_from_slice(&current);
                     prev = line;
                 }
+                zlib.write_data(&input)?;
                 zlib.finish()?
             }
         };
@@ -1335,8 +1340,10 @@ impl<W: Write> Drop for ChunkWriter<'_, W> {
 /// variant is used to signal that.
 enum Wrapper<'a, W: Write> {
     Chunk(ChunkWriter<'a, W>),
+    // #[cfg(feature = "zlib-rs")]
     Flate2(ZlibEncoder<ChunkWriter<'a, W>>),
     FDeflate(fdeflate::Compressor<ChunkWriter<'a, W>>),
+    FDeflateUltraFast(fdeflate::UltraFastCompressor<ChunkWriter<'a, W>>),
     Unrecoverable,
     /// This is used in-between, should never be matched
     None,
@@ -1346,15 +1353,20 @@ impl<'a, W: Write> Wrapper<'a, W> {
     fn from_level(writer: ChunkWriter<'a, W>, compression: DeflateCompression) -> io::Result<Self> {
         Ok(match compression {
             DeflateCompression::NoCompression => {
-                Wrapper::Flate2(ZlibEncoder::new(writer, flate2::Compression::none()))
+                Wrapper::FDeflate(fdeflate::Compressor::new(writer, 0, true)?)
             }
             DeflateCompression::FdeflateUltraFast => {
-                Wrapper::FDeflate(fdeflate::Compressor::new(writer)?)
+                Wrapper::FDeflateUltraFast(fdeflate::UltraFastCompressor::new(writer)?)
             }
+            #[cfg(feature = "zlib-rs")]
             DeflateCompression::Level(level) => Wrapper::Flate2(ZlibEncoder::new(
                 writer,
                 flate2::Compression::new(u32::from(level)),
             )),
+            #[cfg(not(feature = "zlib-rs"))]
+            DeflateCompression::Level(level) => {
+                Wrapper::FDeflate(fdeflate::Compressor::new(writer, level, true)?)
+            }
         })
     }
 
@@ -1621,6 +1633,9 @@ impl<'a, W: Write> StreamWriter<'a, W> {
             Wrapper::FDeflate(wrt) => {
                 wrt.finish()?;
             }
+            Wrapper::FDeflateUltraFast(wrt) => {
+                wrt.finish()?;
+            }
             Wrapper::Flate2(wrt) => {
                 wrt.finish()?;
             }
@@ -1645,7 +1660,7 @@ impl<'a, W: Write> StreamWriter<'a, W> {
                 let err = FormatErrorKind::Unrecoverable.into();
                 return Err(EncodingError::Format(err));
             }
-            Wrapper::Flate2(_) | Wrapper::FDeflate(_) => {
+            Wrapper::Flate2(_) | Wrapper::FDeflate(_) | Wrapper::FDeflateUltraFast(_) => {
                 unreachable!("never called on a half-finished frame")
             }
             Wrapper::None => unreachable!(),
@@ -1706,6 +1721,13 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
                         return Err(err);
                     }
                 },
+                Wrapper::FDeflateUltraFast(wrt) => match wrt.finish() {
+                    Ok(chunk) => self.writer = Wrapper::Chunk(chunk),
+                    Err(err) => {
+                        self.writer = Wrapper::Unrecoverable;
+                        return Err(err);
+                    }
+                },
                 chunk @ Wrapper::Chunk(_) => self.writer = chunk,
                 Wrapper::Unrecoverable => unreachable!(),
                 Wrapper::None => unreachable!(),
@@ -1752,6 +1774,7 @@ impl<'a, W: Write> Write for StreamWriter<'a, W> {
             Wrapper::Flate2(wrt) => wrt.flush()?,
             Wrapper::Chunk(wrt) => wrt.flush()?,
             Wrapper::FDeflate(_) => (), // TODO: Add `flush()` to `fdeflate::Compressor`?
+            Wrapper::FDeflateUltraFast(_) => (), // TODO: Add `flush()` to `fdeflate::UltraFastCompressor`?
             // This handles both the case where we entered an unrecoverable state after zlib
             // decoding failure and after a panic while we had taken the chunk/zlib reader.
             Wrapper::Unrecoverable | Wrapper::None => {

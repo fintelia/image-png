@@ -412,7 +412,7 @@ impl DeflateCompression {
         match value {
             Compression::NoCompression => Self::NoCompression,
             Compression::Fastest => Self::FdeflateUltraFast,
-            Compression::Fast => Self::FdeflateUltraFast,
+            Compression::Fast => Self::Level(1),
             Compression::Balanced => Self::Level(flate2::Compression::default().level() as u8),
             Compression::High => Self::Level(flate2::Compression::best().level() as u8),
         }
