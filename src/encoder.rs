@@ -817,19 +817,32 @@ impl<W: Write> Writer<W> {
             DeflateCompression::Level(level) => {
                 let mut current = vec![0; in_len];
 
-                let mut zlib = fdeflate::Compressor::new(Vec::new(), 1, true)?;
+                // let mut zlib = ZlibEncoder::new(Vec::new(), flate2::Compression::new(2));
+                // for line in data.chunks(in_len) {
+                //     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
+                //     zlib.write_all(&[filter_type as u8])?;
+                //     zlib.write_all(&current)?;
+                //     prev = line;
+                // }
+
+                let mut zlib = fdeflate::Compressor::new(Vec::new(), 2, true)?;
                 let mut input = Vec::new();
-                //ZlibEncoder::new(Vec::new(), flate2::Compression::new(u32::from(level)));
                 for line in data.chunks(in_len) {
                     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
-
-                    // zlib.write_data(&[filter_type as u8])?;
-                    // zlib.write_data(&current)?;
                     input.push(filter_type as u8);
                     input.extend_from_slice(&current);
                     prev = line;
                 }
                 zlib.write_data(&input)?;
+
+                // let mut zlib = fdeflate::Compressor::new(Vec::new(), 3, true)?;
+                // for line in data.chunks(in_len) {
+                //     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
+                //     zlib.write_data(&[filter_type as u8])?;
+                //     zlib.write_data(&current)?;
+                //     prev = line;
+                // }
+
                 zlib.finish()?
             }
         };
