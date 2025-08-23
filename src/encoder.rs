@@ -795,7 +795,24 @@ impl<W: Write> Writer<W> {
                     prev = line;
                 }
 
-                let compressed = compressor.finish()?.into_inner();
+                let mut compressed = compressor.finish()?.into_inner();
+
+                let raw_size = data.len() + height as usize;
+                let stored_size = (raw_size.saturating_sub(1) / u16::MAX as usize)
+                    * (u16::MAX as usize + 5)
+                    + (raw_size % u16::MAX as usize + 5)
+                    + 6;
+                if compressed.len() > stored_size {
+                    let mut zlib = fdeflate::Compressor::new(Vec::new(), 0, true)?;
+                    for line in data.chunks(in_len) {
+                        zlib.write_data(&[0])?;
+                        zlib.write_data(&line)?;
+                    }
+                    compressed = zlib.finish()?;
+                }
+
+                compressed
+
                 // if compressed.len()
                 //     > fdeflate::StoredOnlyCompressor::<()>::compressed_size((in_len + 1) * height)
                 // {
@@ -811,13 +828,13 @@ impl<W: Write> Writer<W> {
                 //     }
                 //     compressor.finish()?.into_inner()
                 // } else {
-                compressed
+                // compressed
                 // }
             }
             DeflateCompression::Level(level) => {
                 let mut current = vec![0; in_len];
 
-                // let mut zlib = ZlibEncoder::new(Vec::new(), flate2::Compression::new(2));
+                // let mut zlib = ZlibEncoder::new(Vec::new(), flate2::Compression::new(level.into()));
                 // for line in data.chunks(in_len) {
                 //     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
                 //     zlib.write_all(&[filter_type as u8])?;
@@ -825,23 +842,23 @@ impl<W: Write> Writer<W> {
                 //     prev = line;
                 // }
 
-                let mut zlib = fdeflate::Compressor::new(Vec::new(), 2, true)?;
-                let mut input = Vec::new();
-                for line in data.chunks(in_len) {
-                    let filter_type = filter(filter_method, bpp, prev, line, &mut current);
-                    input.push(filter_type as u8);
-                    input.extend_from_slice(&current);
-                    prev = line;
-                }
-                zlib.write_data(&input)?;
-
-                // let mut zlib = fdeflate::Compressor::new(Vec::new(), 3, true)?;
+                // let mut zlib = fdeflate::Compressor::new(Vec::new(), level as u8, true)?;
+                // let mut input = Vec::new();
                 // for line in data.chunks(in_len) {
                 //     let filter_type = filter(filter_method, bpp, prev, line, &mut current);
-                //     zlib.write_data(&[filter_type as u8])?;
-                //     zlib.write_data(&current)?;
+                //     input.push(filter_type as u8);
+                //     input.extend_from_slice(&current);
                 //     prev = line;
                 // }
+                // zlib.write_data(&input)?;
+
+                let mut zlib = fdeflate::Compressor::new(Vec::new(), level, true)?;
+                for line in data.chunks(in_len) {
+                    let filter_type = filter(filter_method, bpp, prev, line, &mut current);
+                    zlib.write_data(&[filter_type as u8])?;
+                    zlib.write_data(&current)?;
+                    prev = line;
+                }
 
                 zlib.finish()?
             }
