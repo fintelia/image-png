@@ -389,6 +389,9 @@ pub enum DeflateCompression {
     /// the output stream to detect whether the data is being compressed or not.
     FdeflateUltraFast,
 
+    /// Very fast compression with compression ratio between `FdeflateUltraFast` and `Level(1)`.
+    FdeflateRle,
+
     /// Compression level between 1 and 9, where higher values mean better compression at the cost of
     /// speed.
     ///

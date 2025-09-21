@@ -831,6 +831,18 @@ impl<W: Write> Writer<W> {
                 // compressed
                 // }
             }
+            DeflateCompression::FdeflateRle => {
+                let mut current = vec![0; in_len];
+                let mut zlib = fdeflate::Compressor::new_rle(Vec::new(), true)?;
+                for line in data.chunks(in_len) {
+                    let filter_type = filter(filter_method, bpp, prev, line, &mut current);
+                    zlib.write_data(&[filter_type as u8])?;
+                    zlib.write_data(&current)?;
+                    prev = line;
+                }
+
+                zlib.finish()?
+            }
             DeflateCompression::Level(level) => {
                 let mut current = vec![0; in_len];
 
@@ -1387,6 +1399,9 @@ impl<'a, W: Write> Wrapper<'a, W> {
             }
             DeflateCompression::FdeflateUltraFast => {
                 Wrapper::FDeflateUltraFast(fdeflate::UltraFastCompressor::new(writer)?)
+            }
+            DeflateCompression::FdeflateRle => {
+                Wrapper::FDeflate(fdeflate::Compressor::new_rle(writer, true)?)
             }
             #[cfg(feature = "zlib-rs")]
             DeflateCompression::Level(level) => Wrapper::Flate2(ZlibEncoder::new(
