@@ -1383,6 +1383,7 @@ impl<W: Write> Drop for ChunkWriter<'_, W> {
 enum Wrapper<'a, W: Write> {
     Chunk(ChunkWriter<'a, W>),
     // #[cfg(feature = "zlib-rs")]
+    #[allow(unused)]
     Flate2(ZlibEncoder<ChunkWriter<'a, W>>),
     FDeflate(fdeflate::Compressor<ChunkWriter<'a, W>>),
     FDeflateUltraFast(fdeflate::UltraFastCompressor<ChunkWriter<'a, W>>),
